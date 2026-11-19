@@ -1,5 +1,6 @@
 import os
 import re
+import uuid
 import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
@@ -87,7 +88,12 @@ def get_profile(user_id):
         .execute()
     )
 
-    return result.data[0] if result.data else None
+    row = result.data[0] if result.data else None
+
+    if row:
+        attach_avatars([row])
+
+    return row
 
 
 def get_auth_user():
@@ -201,6 +207,8 @@ def get_unseen_profiles(user_id):
 
         if SHOW_ALL or preferences_match(me, person):
             results.append(person)
+
+    attach_avatars(results)
 
     return results
 
@@ -329,6 +337,179 @@ def save_message(sender_id, receiver_id, message):
 
 
 # ============================================================
+# PROFILE PHOTOS (private Supabase Storage bucket + signed URLs)
+# ============================================================
+
+PHOTO_BUCKET = "profile-photos"
+MAX_PHOTOS = 6
+MAX_PHOTO_BYTES = 5 * 1024 * 1024
+SIGNED_URL_SECONDS = 3600
+
+IMAGE_TYPES = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+}
+
+# Flet renamed ImageFit -> BoxFit in newer versions; support both.
+_BOX_FIT = getattr(ft, "BoxFit", None) or getattr(ft, "ImageFit")
+FIT_COVER = _BOX_FIT.COVER
+FIT_CONTAIN = _BOX_FIT.CONTAIN
+
+# path -> (signed_url, expires_at_timestamp)
+_url_cache = {}
+
+
+def _full_url(url):
+    if url and url.startswith("/"):
+        return f"{SUPABASE_URL}/storage/v1{url}"
+    return url
+
+
+def signed_urls(paths):
+    """Returns {path: signed_url}. One request for all uncached paths."""
+    now = datetime.now(timezone.utc).timestamp()
+    wanted = [p for p in dict.fromkeys(paths) if p]
+
+    missing = [
+        p for p in wanted
+        if p not in _url_cache or _url_cache[p][1] < now + 300
+    ]
+
+    if missing:
+        items = (
+            api().storage.from_(PHOTO_BUCKET)
+            .create_signed_urls(missing, SIGNED_URL_SECONDS)
+        )
+
+        for item in items or []:
+            file_path = item.get("path")
+            url = item.get("signedURL") or item.get("signedUrl")
+
+            if file_path and url and not item.get("error"):
+                _url_cache[file_path] = (
+                    _full_url(url),
+                    now + SIGNED_URL_SECONDS,
+                )
+
+    return {p: _url_cache[p][0] for p in wanted if p in _url_cache}
+
+
+def attach_avatars(people):
+    """Adds person["avatar_url"] (a temporary signed link) to each profile."""
+    paths = [p.get("avatar_path") for p in people if p.get("avatar_path")]
+
+    try:
+        urls = signed_urls(paths) if paths else {}
+    except Exception:
+        urls = {}
+
+    for person in people:
+        person["avatar_url"] = urls.get(person.get("avatar_path"))
+
+    return people
+
+
+def get_photos(user_id):
+    rows = (
+        api().table("profile_photos")
+        .select("*")
+        .eq("user_id", str(user_id))
+        .order("created_at")
+        .execute()
+        .data or []
+    )
+
+    if not rows:
+        return []
+
+    urls = signed_urls([r["path"] for r in rows])
+
+    if not urls:
+        raise RuntimeError(
+            "Could not create photo links. Run arovi_photos.sql in "
+            "Supabase and try again."
+        )
+
+    for row in rows:
+        row["url"] = urls.get(row["path"])
+
+    return [r for r in rows if r.get("url")]
+
+
+def set_main_photo(user_id, file_path):
+    api().table("profiles").update(
+        {"avatar_path": file_path}
+    ).eq("id", str(user_id)).execute()
+
+
+def upload_photo(user_id, filename, data):
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    content_type = IMAGE_TYPES.get(ext)
+
+    if not content_type:
+        raise ValueError("Use a JPG, PNG or WEBP image.")
+
+    if not data or len(data) > MAX_PHOTO_BYTES:
+        raise ValueError("Each photo must be 5 MB or smaller.")
+
+    if len(get_photos(user_id)) >= MAX_PHOTOS:
+        raise ValueError(f"You can upload up to {MAX_PHOTOS} photos.")
+
+    file_path = f"{user_id}/{uuid.uuid4().hex}.{ext}"
+    storage = api().storage.from_(PHOTO_BUCKET)
+
+    storage.upload(file_path, data, {"content-type": content_type})
+
+    try:
+        api().table("profile_photos").insert({
+            "user_id": str(user_id),
+            "path": file_path,
+        }).execute()
+    except Exception:
+        # don't leave an orphan file behind
+        try:
+            storage.remove([file_path])
+        except Exception:
+            pass
+        raise
+
+    profile = get_profile(user_id)
+
+    if profile and not profile.get("avatar_path"):
+        set_main_photo(user_id, file_path)
+
+    return file_path
+
+
+def delete_photo(user_id, photo):
+    try:
+        api().storage.from_(PHOTO_BUCKET).remove([photo["path"]])
+    except Exception:
+        pass
+
+    (
+        api().table("profile_photos")
+        .delete()
+        .eq("id", photo["id"])
+        .eq("user_id", str(user_id))
+        .execute()
+    )
+
+    _url_cache.pop(photo["path"], None)
+
+    profile = get_profile(user_id)
+
+    if profile and profile.get("avatar_path") == photo["path"]:
+        remaining = get_photos(user_id)
+        set_main_photo(
+            user_id,
+            remaining[0]["path"] if remaining else None,
+        )
+
+
+# ============================================================
 # FLET APPLICATION
 # ============================================================
 
@@ -339,6 +520,14 @@ def main(page: ft.Page):
     page.bgcolor = BG
     page.padding = 0
     page.spacing = 0
+
+    # photo picker (Flet 1.x uses page.services; older versions used overlay)
+    file_picker = ft.FilePicker()
+
+    try:
+        page.services.append(file_picker)
+    except AttributeError:
+        page.overlay.append(file_picker)
 
     auth_user = get_auth_user()
     current_user_id = auth_user.id if auth_user else None
@@ -473,7 +662,24 @@ def main(page: ft.Page):
             ),
         )
 
-    def person_avatar(size=54):
+    def person_avatar(size=54, person=None):
+        url = (person or {}).get("avatar_url")
+
+        if url:
+            return ft.Container(
+                width=size,
+                height=size,
+                bgcolor=LIGHT_PINK,
+                border_radius=size / 2,
+                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                content=ft.Image(
+                    src=url,
+                    width=size,
+                    height=size,
+                    fit=FIT_COVER,
+                ),
+            )
+
         return ft.Container(
             width=size,
             height=size,
@@ -485,6 +691,152 @@ def main(page: ft.Page):
                 size=size * 0.55,
                 color=PRIMARY,
             ),
+        )
+
+    def show_photo_viewer(urls, index=0):
+        """Full-screen photo viewer with previous / next."""
+
+        index = max(0, min(index, len(urls) - 1))
+
+        def move(step):
+            show_photo_viewer(urls, (index + step) % len(urls))
+
+        page.clean()
+        page.bgcolor = "#000000"
+        page.padding = 0
+
+        page.add(
+            ft.Column(
+                expand=True,
+                spacing=0,
+                controls=[
+                    ft.Container(
+                        padding=10,
+                        content=ft.Row(
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            controls=[
+                                ft.Text(
+                                    f"{index + 1} / {len(urls)}",
+                                    color=WHITE,
+                                ),
+                                ft.IconButton(
+                                    icon=ft.Icons.CLOSE,
+                                    icon_color=WHITE,
+                                    on_click=lambda e: open_dashboard(),
+                                ),
+                            ],
+                        ),
+                    ),
+                    ft.Container(
+                        expand=True,
+                        alignment=ft.Alignment.CENTER,
+                        content=ft.Image(
+                            src=urls[index],
+                            fit=FIT_CONTAIN,
+                            expand=True,
+                        ),
+                    ),
+                    ft.Container(
+                        padding=10,
+                        content=ft.Row(
+                            alignment=ft.MainAxisAlignment.CENTER,
+                            spacing=40,
+                            controls=[
+                                ft.IconButton(
+                                    icon=ft.Icons.CHEVRON_LEFT,
+                                    icon_color=WHITE,
+                                    icon_size=36,
+                                    on_click=lambda e: move(-1),
+                                ),
+                                ft.IconButton(
+                                    icon=ft.Icons.CHEVRON_RIGHT,
+                                    icon_color=WHITE,
+                                    icon_size=36,
+                                    on_click=lambda e: move(1),
+                                ),
+                            ],
+                        ),
+                    ),
+                ],
+            )
+        )
+
+        page.update()
+
+    def gallery_view(photos, person=None, height=320):
+        """Big photo with tappable thumbnails underneath."""
+
+        if not photos:
+            return person_avatar(120, person)
+
+        urls = [p["url"] for p in photos]
+        current = {"url": urls[0]}
+
+        big = ft.Image(src=urls[0], fit=FIT_COVER, expand=True)
+
+        thumbs = ft.Row(
+            spacing=8,
+            wrap=True,
+            alignment=ft.MainAxisAlignment.CENTER,
+        )
+
+        def build_thumbs(active):
+            thumbs.controls = [
+                ft.Container(
+                    width=54,
+                    height=54,
+                    border_radius=10,
+                    clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                    opacity=1 if u == active else 0.5,
+                    on_click=lambda e, u=u: select(u),
+                    content=ft.Image(
+                        src=u,
+                        width=54,
+                        height=54,
+                        fit=FIT_COVER,
+                    ),
+                )
+                for u in urls
+            ]
+
+        def select(url):
+            current["url"] = url
+            big.src = url
+            build_thumbs(url)
+            page.update()
+
+        build_thumbs(urls[0])
+
+        column_controls = [
+            ft.Container(
+                height=height,
+                border_radius=16,
+                bgcolor=LIGHT_PINK,
+                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                content=big,
+                on_click=lambda e: show_photo_viewer(
+                    urls,
+                    urls.index(current["url"]),
+                ),
+            )
+        ]
+
+        if len(urls) > 1:
+            column_controls.append(thumbs)
+
+        return ft.Row(
+            controls=[
+                ft.Container(
+                    expand=True,
+                    content=ft.Column(
+                        spacing=10,
+                        horizontal_alignment=(
+                            ft.CrossAxisAlignment.STRETCH
+                        ),
+                        controls=column_controls,
+                    ),
+                )
+            ]
         )
 
     def make_scrollable(controls):
@@ -518,7 +870,7 @@ def main(page: ft.Page):
             content=ft.Row(
                 spacing=12,
                 controls=[
-                    person_avatar(52),
+                    person_avatar(52, person),
                     ft.Column(
                         expand=True,
                         spacing=2,
@@ -1268,6 +1620,11 @@ def main(page: ft.Page):
 
         person = queue[idx]
 
+        try:
+            person_photos = get_photos(person["id"])
+        except Exception:
+            person_photos = []
+
         def like_person(e):
 
             try:
@@ -1295,7 +1652,7 @@ def main(page: ft.Page):
             show_discover()
 
         card_controls = [
-            person_avatar(120),
+            gallery_view(person_photos, person),
             ft.Text(
                 f"{display_name(person)}, {person.get('age', '')}",
                 size=24,
@@ -1694,7 +2051,7 @@ def main(page: ft.Page):
                                         origin_tab
                                     ),
                                 ),
-                                person_avatar(42),
+                                person_avatar(42, person),
                                 ft.Column(
                                     expand=True,
                                     spacing=2,
@@ -1916,6 +2273,178 @@ def main(page: ft.Page):
 
             show_welcome()
 
+        # ---------- photos ----------
+        try:
+            photos = get_photos(current_user_id)
+        except Exception as ex:
+            photos = []
+            notice.value = f"Could not load photos: {ex}"
+
+        async def add_photos(e):
+
+            remaining = MAX_PHOTOS - len(photos)
+
+            if remaining <= 0:
+                notify(
+                    f"You can add up to {MAX_PHOTOS} photos. "
+                    "Delete one first."
+                )
+                return
+
+            try:
+                picked = await file_picker.pick_files(
+                    dialog_title="Choose photos",
+                    file_type=ft.FilePickerFileType.IMAGE,
+                    allow_multiple=True,
+                )
+            except Exception as ex:
+                notify(f"Could not open the photo picker: {ex}")
+                return
+
+            if not picked:
+                return
+
+            notify("Uploading...", MUTED)
+
+            added = 0
+            last_error = None
+
+            for f in picked[:remaining]:
+                try:
+                    data = getattr(f, "bytes", None)
+
+                    if not data:
+                        with open(f.path, "rb") as handle:
+                            data = handle.read()
+
+                    await asyncio.to_thread(
+                        upload_photo,
+                        current_user_id,
+                        f.name,
+                        data,
+                    )
+                    added += 1
+
+                except Exception as ex:
+                    last_error = f"{f.name}: {ex}"
+
+            if added:
+                show_profile()
+                notify(
+                    f"{added} photo(s) uploaded."
+                    + (f" Problem: {last_error}" if last_error else ""),
+                    GREEN if not last_error else PRIMARY,
+                )
+            else:
+                notify(last_error or "No photo was uploaded.")
+
+        def photo_tile(photo):
+
+            is_main = photo["path"] == user.get("avatar_path")
+
+            def make_main(e):
+                try:
+                    set_main_photo(current_user_id, photo["path"])
+                except Exception as ex:
+                    notify(f"Could not set main photo: {ex}")
+                    return
+                show_profile()
+
+            def remove(e):
+                try:
+                    delete_photo(current_user_id, photo)
+                except Exception as ex:
+                    notify(f"Could not delete photo: {ex}")
+                    return
+                show_profile()
+
+            return ft.Column(
+                spacing=0,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Container(
+                        width=104,
+                        height=104,
+                        border_radius=12,
+                        on_click=lambda e: show_photo_viewer(
+                            [p["url"] for p in photos],
+                            photos.index(photo),
+                        ),
+                        bgcolor=LIGHT_PINK,
+                        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                        content=ft.Image(
+                            src=photo["url"],
+                            width=104,
+                            height=104,
+                            fit=FIT_COVER,
+                        ),
+                    ),
+                    ft.Row(
+                        spacing=0,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        controls=[
+                            ft.IconButton(
+                                icon=(
+                                    ft.Icons.STAR
+                                    if is_main
+                                    else ft.Icons.STAR_BORDER
+                                ),
+                                icon_color=GOLD if is_main else MUTED,
+                                icon_size=20,
+                                tooltip="Main photo",
+                                on_click=make_main,
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.DELETE_OUTLINE,
+                                icon_color=MUTED,
+                                icon_size=20,
+                                tooltip="Delete photo",
+                                on_click=remove,
+                            ),
+                        ],
+                    ),
+                ],
+            )
+
+        photo_section = panel(
+            ft.Column(
+                spacing=10,
+                controls=[
+                    ft.Text(
+                        f"My photos ({len(photos)}/{MAX_PHOTOS})",
+                        size=16,
+                        weight=ft.FontWeight.BOLD,
+                        color=DARK,
+                    ),
+                    ft.Text(
+                        "The starred photo is your main picture. "
+                        "Everyone on Discover can see your gallery.",
+                        size=12,
+                        color=MUTED,
+                    ),
+                    (
+                        ft.Row(
+                            wrap=True,
+                            spacing=10,
+                            run_spacing=6,
+                            controls=[photo_tile(p) for p in photos],
+                        )
+                        if photos
+                        else ft.Text(
+                            "No photos yet.",
+                            size=13,
+                            color=MUTED,
+                        )
+                    ),
+                    ft.OutlinedButton(
+                        content="ADD PHOTOS",
+                        icon=ft.Icons.ADD_A_PHOTO_OUTLINED,
+                        on_click=add_photos,
+                    ),
+                ],
+            )
+        )
+
         content = make_scrollable([
             app_logo(25),
             heading(
@@ -1929,7 +2458,7 @@ def main(page: ft.Page):
                     ),
                     spacing=8,
                     controls=[
-                        person_avatar(84),
+                        person_avatar(84, user),
                         ft.Text(
                             user.get("email") or "",
                             color=MUTED,
@@ -1938,6 +2467,7 @@ def main(page: ft.Page):
                     ],
                 )
             ),
+            photo_section,
             name,
             age,
             gender,
