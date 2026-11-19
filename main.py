@@ -1,4 +1,3 @@
-
 import os
 import re
 import asyncio
@@ -42,6 +41,10 @@ SUPABASE_KEY = (
     or os.getenv("SUPABASE_KEY")
     or ""
 ).strip()
+
+# Testing helper: set AROVI_SHOW_ALL=1 in .env to skip the
+# gender-preference filter in Discover. Remove it for real use.
+SHOW_ALL = os.getenv("AROVI_SHOW_ALL", "0").strip() == "1"
 
 supabase: Client | None = None
 supabase_error = None
@@ -98,30 +101,37 @@ def get_auth_user():
         return None
 
 
+def norm(value):
+    return (value or "").strip().lower()
+
+
 def gender_label(gender):
     return {
-        "Man": "Men",
-        "Woman": "Women",
-        "Non-binary": "Non-binary",
-    }.get(gender, "")
+        "man": "Men",
+        "woman": "Women",
+        "non-binary": "Non-binary",
+    }.get(norm(gender), "")
+
+
+def accepts(preference, other_gender):
+    """Does `preference` (who I'm interested in) accept `other_gender`?"""
+    pref = norm(preference)
+
+    if pref in ("", "everyone"):
+        return True
+
+    return pref == norm(gender_label(other_gender))
 
 
 def preferences_match(first, second):
-    first_gender = gender_label(first.get("gender", ""))
-    second_gender = gender_label(second.get("gender", ""))
-
-    first_pref = first.get("interested_in", "")
-    second_pref = second.get("interested_in", "")
-
-    first_accepts = (
-        first_pref == "Everyone" or first_pref == first_gender
+    # BUG FIX: the old version compared each person's preference with
+    # their OWN gender, so a Man interested in Women never matched a
+    # Woman interested in Men. Each side is now compared with the
+    # OTHER person's gender.
+    return (
+        accepts(first.get("interested_in"), second.get("gender"))
+        and accepts(second.get("interested_in"), first.get("gender"))
     )
-
-    second_accepts = (
-        second_pref == "Everyone" or second_pref == second_gender
-    )
-
-    return first_accepts and second_accepts
 
 
 def get_unseen_profiles(user_id):
@@ -167,7 +177,8 @@ def get_unseen_profiles(user_id):
     candidates = (
         api_client.table("profiles")
         .select("*")
-        .eq("is_active", True)
+        # a NULL is_active counts as active so older rows still appear
+        .or_("is_active.is.null,is_active.eq.true")
         .neq("id", str(user_id))
         .order("created_at", desc=True)
         .execute()
@@ -185,12 +196,10 @@ def get_unseen_profiles(user_id):
         except (ValueError, TypeError):
             age = 0
 
-        if (
-            person_id
-            and person_id not in excluded
-            and age >= 18
-            and preferences_match(me, person)
-        ):
+        if not person_id or person_id in excluded or age < 18:
+            continue
+
+        if SHOW_ALL or preferences_match(me, person):
             results.append(person)
 
     return results
@@ -242,51 +251,32 @@ def is_matched(user_one, user_two):
 
 
 def create_like(sender_id, receiver_id):
+    """Returns True if this like created a match.
+
+    The match row is created by the database trigger from
+    arovi_supabase_setup.sql (clients are not allowed to insert
+    matches directly, so matches can't be faked)."""
     sender_id = str(sender_id)
     receiver_id = str(receiver_id)
 
     if sender_id == receiver_id:
         return False
 
-    api_client = api()
-
     receiver = get_profile(receiver_id)
 
-    if not receiver or not receiver.get("is_active"):
+    if not receiver or receiver.get("is_active") is False:
         raise ValueError("This profile is unavailable.")
 
-    api_client.table("likes").upsert(
+    api().table("likes").upsert(
         {
             "sender_id": sender_id,
             "receiver_id": receiver_id,
         },
         on_conflict="sender_id,receiver_id",
+        ignore_duplicates=True,
     ).execute()
 
-    reverse = (
-        api_client.table("likes")
-        .select("id")
-        .eq("sender_id", receiver_id)
-        .eq("receiver_id", sender_id)
-        .limit(1)
-        .execute()
-        .data or []
-    )
-
-    if reverse:
-        one, two = sorted([sender_id, receiver_id])
-
-        api_client.table("matches").upsert(
-            {
-                "user_one": one,
-                "user_two": two,
-            },
-            on_conflict="user_one,user_two",
-        ).execute()
-
-        return True
-
-    return False
+    return is_matched(sender_id, receiver_id)
 
 
 def get_conversation(user_one, user_two):
@@ -306,7 +296,7 @@ def get_conversation(user_one, user_two):
 def get_last_message(user_one, user_two):
     rows = (
         api().table("messages")
-        .select("message")
+        .select("message,sender_id,created_at")
         .or_(
             f"and(sender_id.eq.{user_one},receiver_id.eq.{user_two}),"
             f"and(sender_id.eq.{user_two},receiver_id.eq.{user_one})"
@@ -355,6 +345,9 @@ def main(page: ft.Page):
 
     current_tab = "Discover"
     active_notice = None
+
+    # Discover queue, chat poller token, and which user the queue is for
+    state = {"queue": None, "index": 0, "chat_token": 0, "user": None}
 
     # ========================================================
     # REUSABLE UI COMPONENTS
@@ -409,6 +402,21 @@ def main(page: ft.Page):
         return ft.OutlinedButton(
             content=label,
             on_click=action,
+        )
+
+    def wide_button(label, action):
+        # full-width button that is safe inside scrolling columns
+        return ft.Row(
+            controls=[
+                ft.Button(
+                    content=label,
+                    on_click=action,
+                    bgcolor=PRIMARY,
+                    color=WHITE,
+                    height=48,
+                    expand=True,
+                )
+            ]
         )
 
     def heading(title, subtitle=None):
@@ -486,6 +494,96 @@ def main(page: ft.Page):
             scroll=ft.ScrollMode.AUTO,
             spacing=14,
         )
+
+    def display_name(person):
+        return person.get("name") or "AROVI member"
+
+    def person_subtitle(person):
+        parts = []
+
+        if person.get("age"):
+            parts.append(str(person["age"]))
+
+        if person.get("location"):
+            parts.append(person["location"])
+
+        return "  •  ".join(parts)
+
+    def person_row(person, subtitle, on_tap):
+        return ft.Container(
+            bgcolor=WHITE,
+            border_radius=18,
+            padding=12,
+            on_click=on_tap,
+            content=ft.Row(
+                spacing=12,
+                controls=[
+                    person_avatar(52),
+                    ft.Column(
+                        expand=True,
+                        spacing=2,
+                        controls=[
+                            ft.Text(
+                                display_name(person),
+                                size=15,
+                                weight=ft.FontWeight.BOLD,
+                                color=DARK,
+                            ),
+                            ft.Text(
+                                subtitle,
+                                size=12,
+                                color=MUTED,
+                                max_lines=1,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),
+                        ],
+                    ),
+                    ft.Icon(ft.Icons.CHEVRON_RIGHT, color=MUTED),
+                ],
+            ),
+        )
+
+    def empty_view(icon, title, subtitle):
+        return ft.Container(
+            expand=True,
+            alignment=ft.Alignment.CENTER,
+            content=ft.Column(
+                alignment=ft.MainAxisAlignment.CENTER,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=12,
+                controls=[
+                    centered_icon(icon),
+                    ft.Text(
+                        title,
+                        size=18,
+                        weight=ft.FontWeight.BOLD,
+                        color=DARK,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    ft.Text(
+                        subtitle,
+                        size=13,
+                        color=MUTED,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                ],
+            ),
+        )
+
+    def error_view(title, exc, retry):
+        return make_scrollable([
+            app_logo(25),
+            heading(title, "Something went wrong talking to the server."),
+            panel(
+                ft.Text(
+                    str(exc),
+                    size=12,
+                    color=MUTED,
+                    selectable=True,
+                )
+            ),
+            wide_button("TRY AGAIN", lambda e: retry()),
+        ])
 
     def show_screen(content, navigation=False):
         page.clean()
@@ -731,6 +829,7 @@ def main(page: ft.Page):
             options=[
                 ft.dropdown.Option("Men"),
                 ft.dropdown.Option("Women"),
+                ft.dropdown.Option("Non-binary"),
                 ft.dropdown.Option("Everyone"),
             ],
         )
@@ -929,7 +1028,8 @@ def main(page: ft.Page):
                     current_user_id = None
 
                     notify(
-                        "This account does not meet the 18+ requirement."
+                        "This account has no valid profile yet. "
+                        "Run the Supabase setup SQL, then sign in again."
                     )
                     return
 
@@ -970,9 +1070,16 @@ def main(page: ft.Page):
 
         nonlocal current_user_id
 
+        # stops any running chat poller
+        state["chat_token"] += 1
+
         if not current_user_id:
             show_welcome()
             return
+
+        # a different user signed in -> start with a fresh Discover queue
+        if state["user"] != current_user_id:
+            state.update(queue=None, index=0, user=current_user_id)
 
         try:
             user = get_profile(current_user_id)
@@ -980,19 +1087,10 @@ def main(page: ft.Page):
         except Exception as ex:
 
             show_screen(
-                ft.Column(
-                    controls=[
-                        app_logo(25),
-                        heading("Connection problem"),
-                        ft.Text(
-                            f"Could not load your account: {ex}",
-                            color=PRIMARY,
-                        ),
-                        secondary_button(
-                            "Retry",
-                            lambda e: open_dashboard(),
-                        ),
-                    ]
+                error_view(
+                    "Connection problem",
+                    ex,
+                    open_dashboard,
                 )
             )
             return
@@ -1027,29 +1125,64 @@ def main(page: ft.Page):
     # DISCOVER
     # ========================================================
 
+    def reload_discover(e=None):
+        state["queue"] = None
+        state["index"] = 0
+        show_discover()
+
+    def show_match_screen(person):
+
+        name = display_name(person)
+
+        show_screen(
+            ft.Column(
+                expand=True,
+                alignment=ft.MainAxisAlignment.CENTER,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=16,
+                controls=[
+                    centered_icon(ft.Icons.FAVORITE, 52),
+                    ft.Text(
+                        "It's a match!",
+                        size=30,
+                        weight=ft.FontWeight.BOLD,
+                        color=PRIMARY,
+                    ),
+                    ft.Text(
+                        f"You and {name} liked each other.",
+                        size=14,
+                        color=MUTED,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    ft.Container(height=8),
+                    wide_button(
+                        "SEND A MESSAGE",
+                        lambda e: open_chat(person["id"], "Matches"),
+                    ),
+                    secondary_button(
+                        "KEEP BROWSING",
+                        lambda e: open_dashboard(),
+                    ),
+                ],
+            )
+        )
+
     def show_discover():
 
         try:
-
             user = get_profile(current_user_id)
-            profiles = get_unseen_profiles(current_user_id)
+
+            if state["queue"] is None:
+                state["queue"] = get_unseen_profiles(current_user_id)
+                state["index"] = 0
 
         except Exception as ex:
 
             show_screen(
-                ft.Column(
-                    controls=[
-                        app_logo(25),
-                        heading(
-                            "Discover",
-                            "Could not load profiles.",
-                        ),
-                        ft.Text(str(ex), color=PRIMARY),
-                        secondary_button(
-                            "Retry",
-                            lambda e: show_discover(),
-                        ),
-                    ]
+                error_view(
+                    "Could not load Discover",
+                    ex,
+                    reload_discover,
                 ),
                 navigation=True,
             )
@@ -1057,147 +1190,197 @@ def main(page: ft.Page):
 
         notice = make_notice()
 
-        first_name = (
-            (user.get("name") or "there").split()[0]
+        name_parts = (user.get("name") or "").split()
+        first_name = name_parts[0] if name_parts else "there"
+
+        header = ft.Row(
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            controls=[
+                app_logo(25),
+                ft.Row(
+                    spacing=0,
+                    controls=[
+                        ft.Text(
+                            f"Hello, {first_name}",
+                            color=DARK,
+                            weight=ft.FontWeight.BOLD,
+                        ),
+                        ft.IconButton(
+                            icon=ft.Icons.REFRESH,
+                            icon_color=PRIMARY,
+                            tooltip="Refresh",
+                            on_click=reload_discover,
+                        ),
+                    ],
+                ),
+            ],
         )
 
-        controls = [
+        # Explain WHY Discover is empty instead of a blank screen
+        if not user.get("gender") or not user.get("interested_in"):
+
+            show_screen(
+                ft.Column(
+                    expand=True,
+                    spacing=14,
+                    controls=[
+                        header,
+                        empty_view(
+                            ft.Icons.EDIT_OUTLINED,
+                            "Finish your profile",
+                            "Set who you are and who you're interested in "
+                            "on the Profile tab so we can show you people.",
+                        ),
+                        wide_button(
+                            "GO TO PROFILE",
+                            lambda e: set_tab("Profile"),
+                        ),
+                    ],
+                ),
+                navigation=True,
+            )
+            return
+
+        queue = state["queue"]
+        idx = state["index"]
+
+        if idx >= len(queue):
+
+            show_screen(
+                ft.Column(
+                    expand=True,
+                    spacing=14,
+                    controls=[
+                        header,
+                        empty_view(
+                            ft.Icons.EXPLORE_OUTLINED,
+                            "No new profiles yet",
+                            "You've seen everyone who fits your "
+                            "preferences. Check back later when more "
+                            "people join AROVI.",
+                        ),
+                        wide_button("REFRESH", reload_discover),
+                    ],
+                ),
+                navigation=True,
+            )
+            return
+
+        person = queue[idx]
+
+        def like_person(e):
+
+            try:
+                mutual = create_like(
+                    current_user_id,
+                    person["id"],
+                )
+            except Exception as ex:
+                notify(f"Could not send like: {ex}")
+                return
+
+            state["index"] += 1
+
+            if mutual:
+                show_match_screen(person)
+            else:
+                show_discover()
+                notify(
+                    "Like sent. If they like you back, you'll match.",
+                    GREEN,
+                )
+
+        def skip_person(e):
+            state["index"] += 1
+            show_discover()
+
+        card_controls = [
+            person_avatar(120),
+            ft.Text(
+                f"{display_name(person)}, {person.get('age', '')}",
+                size=24,
+                weight=ft.FontWeight.BOLD,
+                color=DARK,
+                text_align=ft.TextAlign.CENTER,
+            ),
             ft.Row(
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=4,
                 controls=[
-                    app_logo(25),
+                    ft.Icon(
+                        ft.Icons.LOCATION_ON_OUTLINED,
+                        size=16,
+                        color=PRIMARY,
+                    ),
                     ft.Text(
-                        f"Hello, {first_name}",
-                        color=DARK,
-                        weight=ft.FontWeight.BOLD,
+                        person.get("location") or "Location not provided",
+                        size=13,
+                        color=MUTED,
                     ),
                 ],
             ),
-            heading(
-                "Discover",
-                "Explore adults who may share your interests.",
-            ),
-            notice,
         ]
 
-        if not profiles:
+        bio_text = (person.get("bio") or "").strip()
 
-            controls.append(
+        card_controls.append(
+            ft.Text(
+                bio_text or "This member has not added a bio yet.",
+                size=14,
+                color=DARK if bio_text else MUTED,
+                text_align=ft.TextAlign.CENTER,
+            )
+        )
+
+        actions = ft.Row(
+            alignment=ft.MainAxisAlignment.CENTER,
+            spacing=28,
+            controls=[
+                ft.Container(
+                    bgcolor=WHITE,
+                    border_radius=40,
+                    content=ft.IconButton(
+                        icon=ft.Icons.CLOSE,
+                        icon_size=32,
+                        icon_color=MUTED,
+                        tooltip="Pass",
+                        on_click=skip_person,
+                    ),
+                ),
+                ft.Container(
+                    bgcolor=PRIMARY,
+                    border_radius=40,
+                    content=ft.IconButton(
+                        icon=ft.Icons.FAVORITE,
+                        icon_size=32,
+                        icon_color=WHITE,
+                        tooltip="Like",
+                        on_click=like_person,
+                    ),
+                ),
+            ],
+        )
+
+        show_screen(
+            make_scrollable([
+                header,
+                heading(
+                    "Discover",
+                    f"{len(queue) - idx} people to meet",
+                ),
                 panel(
                     ft.Column(
                         horizontal_alignment=(
                             ft.CrossAxisAlignment.CENTER
                         ),
                         spacing=12,
-                        controls=[
-                            ft.Icon(
-                                ft.Icons.EXPLORE_OFF,
-                                size=48,
-                                color=PRIMARY,
-                            ),
-                            ft.Text(
-                                "No new profiles yet",
-                                size=18,
-                                weight=ft.FontWeight.BOLD,
-                                color=DARK,
-                            ),
-                            ft.Text(
-                                "Check back later when more people "
-                                "join AROVI.",
-                                color=MUTED,
-                                text_align=ft.TextAlign.CENTER,
-                            ),
-                        ],
-                    )
-                )
-            )
-
-        else:
-
-            for person in profiles:
-
-                def like_person(e, person_id=person["id"]):
-
-                    try:
-
-                        mutual = create_like(
-                            current_user_id,
-                            person_id,
-                        )
-
-                        show_discover()
-
-                        notify(
-                            "It's a match! You can now message each other."
-                            if mutual
-                            else "Like sent. If they like you back, "
-                                 "you'll match.",
-                            GREEN,
-                        )
-
-                    except Exception as ex:
-                        notify(f"Could not send like: {ex}")
-
-                bio_text = (
-                    person.get("bio")
-                    or "This member has not added a bio yet."
-                )
-
-                controls.append(
-                    panel(
-                        ft.Column(
-                            spacing=10,
-                            controls=[
-                                ft.Container(
-                                    height=135,
-                                    bgcolor=LIGHT_PINK,
-                                    border_radius=15,
-                                    alignment=ft.Alignment.CENTER,
-                                    content=ft.Icon(
-                                        ft.Icons.PERSON,
-                                        size=70,
-                                        color=PRIMARY,
-                                    ),
-                                ),
-                                ft.Text(
-                                    f"{person.get('name', 'AROVI member')}, "
-                                    f"{person.get('age', '')}",
-                                    size=21,
-                                    weight=ft.FontWeight.BOLD,
-                                    color=DARK,
-                                ),
-                                ft.Row(
-                                    spacing=6,
-                                    controls=[
-                                        ft.Icon(
-                                            ft.Icons.LOCATION_ON_OUTLINED,
-                                            size=16,
-                                            color=PRIMARY,
-                                        ),
-                                        ft.Text(
-                                            person.get("location")
-                                            or "Location not provided",
-                                            size=12,
-                                            color=MUTED,
-                                        ),
-                                    ],
-                                ),
-                                ft.Text(
-                                    bio_text,
-                                    size=13,
-                                    color=DARK,
-                                ),
-                                primary_button(
-                                    "LIKE PROFILE",
-                                    like_person,
-                                ),
-                            ],
-                        )
-                    )
-                )
-
-        show_screen(
-            make_scrollable(controls),
+                        controls=card_controls,
+                    ),
+                    padding=28,
+                ),
+                notice,
+                actions,
+            ]),
             navigation=True,
         )
 
@@ -1207,105 +1390,49 @@ def main(page: ft.Page):
 
     def show_matches():
 
-        notice = make_notice()
-
         try:
             matches = get_matches(current_user_id)
-
         except Exception as ex:
-            matches = []
-            notice.value = f"Could not load matches: {ex}"
+            show_screen(
+                error_view(
+                    "Could not load matches",
+                    ex,
+                    open_dashboard,
+                ),
+                navigation=True,
+            )
+            return
 
         controls = [
             app_logo(25),
             heading(
                 "Your matches",
-                "People who have liked you back.",
+                f"{len(matches)} mutual connection(s)",
             ),
-            notice,
         ]
 
         if not matches:
 
             controls.append(
-                panel(
-                    ft.Column(
-                        horizontal_alignment=(
-                            ft.CrossAxisAlignment.CENTER
-                        ),
-                        spacing=10,
-                        controls=[
-                            ft.Icon(
-                                ft.Icons.FAVORITE_BORDER,
-                                size=45,
-                                color=PRIMARY,
-                            ),
-                            ft.Text(
-                                "No matches yet",
-                                size=18,
-                                weight=ft.FontWeight.BOLD,
-                                color=DARK,
-                            ),
-                            ft.Text(
-                                "Like profiles in Discover. When someone "
-                                "likes you back, the match will appear here.",
-                                text_align=ft.TextAlign.CENTER,
-                                color=MUTED,
-                            ),
-                        ],
-                    )
+                empty_view(
+                    ft.Icons.FAVORITE_BORDER,
+                    "No matches yet",
+                    "Like profiles in Discover. When someone likes you "
+                    "back, the match will appear here.",
                 )
             )
 
         else:
 
             for person in matches:
-
-                def open_match_chat(
-                    e,
-                    person_id=person["id"],
-                ):
-                    open_chat(person_id)
-
                 controls.append(
-                    panel(
-                        ft.Row(
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            controls=[
-                                ft.Row(
-                                    expand=True,
-                                    spacing=12,
-                                    controls=[
-                                        person_avatar(48),
-                                        ft.Column(
-                                            expand=True,
-                                            spacing=3,
-                                            controls=[
-                                                ft.Text(
-                                                    person.get(
-                                                        "name",
-                                                        "AROVI member",
-                                                    ),
-                                                    weight=ft.FontWeight.BOLD,
-                                                    color=DARK,
-                                                ),
-                                                ft.Text(
-                                                    f"{person.get('age', '')} "
-                                                    f"• {person.get('location') or ''}",
-                                                    size=11,
-                                                    color=MUTED,
-                                                ),
-                                            ],
-                                        ),
-                                    ],
-                                ),
-                                ft.IconButton(
-                                    icon=ft.Icons.CHAT,
-                                    icon_color=PRIMARY,
-                                    on_click=open_match_chat,
-                                ),
-                            ],
-                        )
+                    person_row(
+                        person,
+                        person_subtitle(person),
+                        lambda e, pid=person["id"]: open_chat(
+                            pid,
+                            "Matches",
+                        ),
                     )
                 )
 
@@ -1320,14 +1447,33 @@ def main(page: ft.Page):
 
     def show_messages():
 
-        notice = make_notice()
-
         try:
             matches = get_matches(current_user_id)
+            rows = []
+
+            for person in matches:
+                last = get_last_message(
+                    current_user_id,
+                    person["id"],
+                )
+                rows.append((person, last))
 
         except Exception as ex:
-            matches = []
-            notice.value = f"Could not load messages: {ex}"
+            show_screen(
+                error_view(
+                    "Could not load messages",
+                    ex,
+                    open_dashboard,
+                ),
+                navigation=True,
+            )
+            return
+
+        # newest conversation first, empty ones last
+        rows.sort(
+            key=lambda item: (item[1] or {}).get("created_at") or "",
+            reverse=True,
+        )
 
         controls = [
             app_logo(25),
@@ -1335,68 +1481,40 @@ def main(page: ft.Page):
                 "Messages",
                 "Continue conversations with your matches.",
             ),
-            notice,
         ]
 
-        if not matches:
+        if not rows:
 
             controls.append(
-                panel(
-                    ft.Text(
-                        "You need a mutual match before you can "
-                        "start messaging.",
-                        color=MUTED,
-                        text_align=ft.TextAlign.CENTER,
-                    )
+                empty_view(
+                    ft.Icons.CHAT_BUBBLE_OUTLINE,
+                    "No conversations yet",
+                    "You need a mutual match before you can "
+                    "start messaging.",
                 )
             )
 
         else:
 
-            for person in matches:
+            for person, last in rows:
 
-                try:
-                    last = get_last_message(
-                        current_user_id,
-                        person["id"],
+                if last:
+                    mine = (
+                        str(last.get("sender_id"))
+                        == str(current_user_id)
                     )
-                except Exception:
-                    last = None
-
-                preview = (
-                    last["message"]
-                    if last
-                    else "Start a conversation"
-                )
-
-                def open_person_chat(
-                    e,
-                    person_id=person["id"],
-                ):
-                    open_chat(person_id)
+                    preview = ("You: " if mine else "") + last["message"]
+                else:
+                    preview = "Say hello 👋"
 
                 controls.append(
-                    panel(
-                        ft.ListTile(
-                            leading=person_avatar(45),
-                            title=ft.Text(
-                                person.get(
-                                    "name",
-                                    "AROVI member",
-                                ),
-                                weight=ft.FontWeight.BOLD,
-                                color=DARK,
-                            ),
-                            subtitle=ft.Text(
-                                preview,
-                                max_lines=1,
-                            ),
-                            trailing=ft.Icon(
-                                ft.Icons.CHEVRON_RIGHT,
-                                color=PRIMARY,
-                            ),
-                            on_click=open_person_chat,
-                        )
+                    person_row(
+                        person,
+                        preview,
+                        lambda e, pid=person["id"]: open_chat(
+                            pid,
+                            "Messages",
+                        ),
                     )
                 )
 
@@ -1409,7 +1527,9 @@ def main(page: ft.Page):
     # PRIVATE CHAT
     # ========================================================
 
-    def open_chat(other_user_id):
+    def open_chat(other_user_id, origin_tab="Messages"):
+
+        nonlocal current_tab
 
         try:
 
@@ -1422,95 +1542,90 @@ def main(page: ft.Page):
                     other_user_id,
                 )
             ):
-                show_messages()
+                set_tab("Messages")
                 return
 
         except Exception:
-            show_messages()
+            set_tab("Messages")
             return
+
+        state["chat_token"] += 1
+        token = state["chat_token"]
+        shown = {"count": -1}
 
         notice = make_notice()
 
         message_input = ft.TextField(
             hint_text="Write a message...",
             expand=True,
+            filled=True,
+            bgcolor=WHITE,
+            border_radius=20,
             text_size=14,
         )
 
-        chat_column = ft.Column(
+        chat_list = ft.ListView(
             expand=True,
-            scroll=ft.ScrollMode.AUTO,
             spacing=10,
+            auto_scroll=True,
         )
 
-        def refresh_chat():
+        def bubble(msg):
 
-            chat_column.controls.clear()
+            mine = (
+                str(msg.get("sender_id"))
+                == str(current_user_id)
+            )
 
-            try:
-
-                messages = get_conversation(
-                    current_user_id,
-                    other_user_id,
-                )
-
-            except Exception as ex:
-
-                chat_column.controls.append(
-                    ft.Text(
-                        f"Could not load conversation: {ex}",
-                        color=PRIMARY,
+            return ft.Column(
+                horizontal_alignment=(
+                    ft.CrossAxisAlignment.END
+                    if mine
+                    else ft.CrossAxisAlignment.START
+                ),
+                controls=[
+                    ft.Container(
+                        bgcolor=PRIMARY if mine else LIGHT_PINK,
+                        border_radius=14,
+                        padding=ft.Padding(
+                            left=14,
+                            top=9,
+                            right=14,
+                            bottom=9,
+                        ),
+                        content=ft.Text(
+                            msg.get("message", ""),
+                            color=WHITE if mine else DARK,
+                            size=14,
+                            selectable=True,
+                        ),
                     )
-                )
-                return
+                ],
+            )
 
-            if not messages:
+        def render(messages, update=True):
 
-                chat_column.controls.append(
+            if messages:
+                chat_list.controls = [bubble(m) for m in messages]
+            else:
+                chat_list.controls = [
                     ft.Container(
                         padding=20,
                         alignment=ft.Alignment.CENTER,
                         content=ft.Text(
-                            "Say hello and start your conversation.",
+                            "You matched! Say hello 👋",
                             color=MUTED,
                             text_align=ft.TextAlign.CENTER,
                         ),
                     )
-                )
+                ]
 
-            for msg in messages:
+            shown["count"] = len(messages)
 
-                mine = (
-                    str(msg["sender_id"])
-                    == str(current_user_id)
-                )
+            if update:
+                page.update()
 
-                chat_column.controls.append(
-                    ft.Row(
-                        alignment=(
-                            ft.MainAxisAlignment.END
-                            if mine
-                            else ft.MainAxisAlignment.START
-                        ),
-                        controls=[
-                            ft.Container(
-                                content=ft.Text(
-                                    msg["message"],
-                                    color=WHITE if mine else DARK,
-                                    size=13,
-                                ),
-                                padding=12,
-                                bgcolor=(
-                                    PRIMARY if mine else LIGHT_PINK
-                                ),
-                                border_radius=14,
-                                width=250,
-                            )
-                        ],
-                    )
-                )
-
-        def send_message(e):
+        def send_message(e=None):
 
             message = (message_input.value or "").strip()
 
@@ -1518,9 +1633,7 @@ def main(page: ft.Page):
                 return
 
             if len(message) > 2000:
-                notify(
-                    "Messages cannot exceed 2,000 characters."
-                )
+                notify("Messages cannot exceed 2,000 characters.")
                 return
 
             try:
@@ -1535,13 +1648,30 @@ def main(page: ft.Page):
 
                 message_input.value = ""
 
-                refresh_chat()
-                page.update()
+                render(
+                    get_conversation(
+                        current_user_id,
+                        other_user_id,
+                    )
+                )
 
             except Exception as ex:
                 notify(f"Message error: {ex}")
 
-        refresh_chat()
+        message_input.on_submit = send_message
+
+        try:
+            render(
+                get_conversation(current_user_id, other_user_id),
+                update=False,
+            )
+        except Exception as ex:
+            chat_list.controls = [
+                ft.Text(
+                    f"Could not load conversation: {ex}",
+                    color=PRIMARY,
+                )
+            ]
 
         page.clean()
         page.bgcolor = BG
@@ -1559,7 +1689,10 @@ def main(page: ft.Page):
                             controls=[
                                 ft.IconButton(
                                     icon=ft.Icons.ARROW_BACK,
-                                    on_click=lambda e: show_messages(),
+                                    icon_color=PRIMARY,
+                                    on_click=lambda e: set_tab(
+                                        origin_tab
+                                    ),
                                 ),
                                 person_avatar(42),
                                 ft.Column(
@@ -1567,10 +1700,7 @@ def main(page: ft.Page):
                                     spacing=2,
                                     controls=[
                                         ft.Text(
-                                            person.get(
-                                                "name",
-                                                "AROVI member",
-                                            ),
+                                            display_name(person),
                                             weight=ft.FontWeight.BOLD,
                                             color=DARK,
                                         ),
@@ -1587,7 +1717,7 @@ def main(page: ft.Page):
                     ft.Container(
                         expand=True,
                         padding=12,
-                        content=chat_column,
+                        content=chat_list,
                     ),
                     ft.Container(
                         padding=10,
@@ -1615,6 +1745,34 @@ def main(page: ft.Page):
 
         page.update()
 
+        # light polling so new messages appear without reopening the chat
+        async def poll():
+
+            while state["chat_token"] == token:
+
+                await asyncio.sleep(4)
+
+                if state["chat_token"] != token:
+                    break
+
+                try:
+                    rows = await asyncio.to_thread(
+                        get_conversation,
+                        current_user_id,
+                        other_user_id,
+                    )
+
+                    if (
+                        state["chat_token"] == token
+                        and len(rows) != shown["count"]
+                    ):
+                        render(rows)
+
+                except Exception:
+                    pass
+
+        page.run_task(poll)
+
     # ========================================================
     # PROFILE
     # ========================================================
@@ -1627,12 +1785,10 @@ def main(page: ft.Page):
         except Exception as ex:
 
             show_screen(
-                ft.Column(
-                    controls=[
-                        app_logo(25),
-                        heading("My profile"),
-                        ft.Text(str(ex), color=PRIMARY),
-                    ]
+                error_view(
+                    "Could not load your profile",
+                    ex,
+                    open_dashboard,
                 ),
                 navigation=True,
             )
@@ -1645,13 +1801,13 @@ def main(page: ft.Page):
         notice = make_notice()
 
         name = field("Full name")
-        name.value = user.get("name", "")
+        name.value = user.get("name") or ""
 
         age = field(
             "Age",
             keyboard=ft.KeyboardType.NUMBER,
         )
-        age.value = str(user.get("age", ""))
+        age.value = str(user.get("age") or "")
 
         location = field("Location")
         location.value = user.get("location") or ""
@@ -1664,11 +1820,12 @@ def main(page: ft.Page):
             max_lines=5,
             filled=True,
             bgcolor=WHITE,
+            border_radius=12,
         )
 
         gender = ft.Dropdown(
             label="Gender",
-            value=user.get("gender"),
+            value=user.get("gender") or None,
             options=[
                 ft.dropdown.Option("Man"),
                 ft.dropdown.Option("Woman"),
@@ -1678,12 +1835,19 @@ def main(page: ft.Page):
 
         interested = ft.Dropdown(
             label="Interested in",
-            value=user.get("interested_in"),
+            value=user.get("interested_in") or None,
             options=[
                 ft.dropdown.Option("Men"),
                 ft.dropdown.Option("Women"),
+                ft.dropdown.Option("Non-binary"),
                 ft.dropdown.Option("Everyone"),
             ],
+        )
+
+        visible = ft.Switch(
+            label="Show my profile in Discover",
+            value=user.get("is_active") is not False,
+            active_color=PRIMARY,
         )
 
         def save_profile(e):
@@ -1714,9 +1878,10 @@ def main(page: ft.Page):
                     "name": updated_name,
                     "age": updated_age,
                     "location": (location.value or "").strip(),
-                    "bio": (bio.value or "").strip(),
+                    "bio": (bio.value or "").strip()[:500],
                     "gender": gender.value,
                     "interested_in": interested.value,
+                    "is_active": bool(visible.value),
                     "updated_at": datetime.now(
                         timezone.utc
                     ).isoformat(),
@@ -1724,6 +1889,9 @@ def main(page: ft.Page):
                     "id",
                     str(current_user_id),
                 ).execute()
+
+                # preferences may have changed -> rebuild Discover
+                state["queue"] = None
 
                 notify(
                     "Profile updated successfully.",
@@ -1744,6 +1912,7 @@ def main(page: ft.Page):
 
             current_user_id = None
             current_tab = "Discover"
+            state.update(queue=None, index=0, user=None)
 
             show_welcome()
 
@@ -1751,7 +1920,7 @@ def main(page: ft.Page):
             app_logo(25),
             heading(
                 "My profile",
-                "Keep your information up to date.",
+                "This is what others see on Discover.",
             ),
             panel(
                 ft.Column(
@@ -1775,8 +1944,9 @@ def main(page: ft.Page):
             interested,
             location,
             bio,
+            visible,
             notice,
-            primary_button(
+            wide_button(
                 "SAVE PROFILE",
                 save_profile,
             ),
