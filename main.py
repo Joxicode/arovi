@@ -840,7 +840,16 @@ def main(page: ft.Page):
                     )
 
             except Exception as ex:
-                notify(f"Registration error: {ex}")
+    import traceback
+
+    error_details = traceback.format_exc()
+
+    print("AROVI REGISTRATION ERROR:")
+    print(error_details)
+
+    notify(
+        f"Registration error: {str(ex)}"
+    )
 
         content = make_scrollable([
             app_logo(30),
