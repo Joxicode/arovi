@@ -2291,12 +2291,21 @@ def main(page: ft.Page):
                 )
                 return
 
+            picker_args = dict(
+                dialog_title="Choose photos",
+                file_type=ft.FilePickerFileType.IMAGE,
+                allow_multiple=True,
+            )
+
             try:
-                picked = await file_picker.pick_files(
-                    dialog_title="Choose photos",
-                    file_type=ft.FilePickerFileType.IMAGE,
-                    allow_multiple=True,
-                )
+                try:
+                    # ask the phone to send the image bytes (no file path on Android)
+                    picked = await file_picker.pick_files(
+                        with_data=True,
+                        **picker_args,
+                    )
+                except TypeError:
+                    picked = await file_picker.pick_files(**picker_args)
             except Exception as ex:
                 notify(f"Could not open the photo picker: {ex}")
                 return
@@ -2313,9 +2322,14 @@ def main(page: ft.Page):
                 try:
                     data = getattr(f, "bytes", None)
 
-                    if not data:
+                    if not data and getattr(f, "path", None):
                         with open(f.path, "rb") as handle:
                             data = handle.read()
+
+                    if not data:
+                        raise ValueError(
+                            "the phone did not send the image data"
+                        )
 
                     await asyncio.to_thread(
                         upload_photo,
