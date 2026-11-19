@@ -27,9 +27,6 @@ MUTED = "#8A7880"
 GREEN = "#267A59"
 LIGHT_PINK = "#F3E2E9"
 
-# ============================================================
-# ENVIRONMENT CONFIGURATION
-# ============================================================
 
 # ============================================================
 # ENVIRONMENT CONFIGURATION
@@ -62,9 +59,12 @@ else:
         "Supabase URL or publishable key is missing."
     )
 
+
 def api():
     if supabase is None:
-        raise RuntimeError(supabase_error or "Supabase is unavailable.")
+        raise RuntimeError(
+            supabase_error or "Supabase is unavailable."
+        )
     return supabase
 
 
@@ -840,16 +840,16 @@ def main(page: ft.Page):
                     )
 
             except Exception as ex:
-    import traceback
+                import traceback
 
-    error_details = traceback.format_exc()
+                error_details = traceback.format_exc()
 
-    print("AROVI REGISTRATION ERROR:")
-    print(error_details)
+                print("AROVI REGISTRATION ERROR:")
+                print(error_details)
 
-    notify(
-        f"Registration error: {str(ex)}"
-    )
+                notify(
+                    f"Registration error: {type(ex).__name__}: {str(ex)}"
+                )
 
         content = make_scrollable([
             app_logo(30),
