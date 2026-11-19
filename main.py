@@ -31,26 +31,36 @@ LIGHT_PINK = "#F3E2E9"
 # ENVIRONMENT CONFIGURATION
 # ============================================================
 
+# ============================================================
+# ENVIRONMENT CONFIGURATION
+# ============================================================
+
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_PUBLISHABLE_KEY")
+    or os.getenv("SUPABASE_KEY")
+    or ""
+).strip()
 
 supabase: Client | None = None
 supabase_error = None
 
 if SUPABASE_URL and SUPABASE_KEY:
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase = create_client(
+            SUPABASE_URL,
+            SUPABASE_KEY
+        )
     except Exception as exc:
         supabase_error = f"Supabase initialization failed: {exc}"
 else:
     supabase_error = (
-        "Supabase credentials are missing. "
-        "Create a .env file beside main.py."
+        "Supabase URL or publishable key is missing."
     )
-
 
 def api():
     if supabase is None:
