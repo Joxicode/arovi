@@ -13,7 +13,7 @@ from supabase import create_client, Client
 # ============================================================
 # AROVI - ADULT MATCHMAKING MOBILE APPLICATION
 # Flet 1.1.2 + Supabase Authentication + PostgreSQL
-# Complete single-file application
+# Complete single-file application (with built-in admin side)
 # ============================================================
 
 APP_NAME = "AROVI"
@@ -111,6 +111,11 @@ def norm(value):
     return (value or "").strip().lower()
 
 
+def is_blocked(profile):
+    """True when an admin has suspended or banned this account."""
+    return norm((profile or {}).get("status")) in ("suspended", "banned")
+
+
 def gender_label(gender):
     return {
         "man": "Men",
@@ -185,6 +190,8 @@ def get_unseen_profiles(user_id):
         .select("*")
         # a NULL is_active counts as active so older rows still appear
         .or_("is_active.is.null,is_active.eq.true")
+        # suspended / banned members never appear in Discover
+        .eq("status", "active")
         .neq("id", str(user_id))
         .order("created_at", desc=True)
         .execute()
@@ -236,7 +243,7 @@ def get_matches(user_id):
 
         person = get_profile(other_id)
 
-        if person:
+        if person and not is_blocked(person):
             person["match_id"] = match["id"]
             people.append(person)
 
@@ -259,11 +266,7 @@ def is_matched(user_one, user_two):
 
 
 def create_like(sender_id, receiver_id):
-    """Returns True if this like created a match.
-
-    The match row is created by the database trigger from
-    arovi_supabase_setup.sql (clients are not allowed to insert
-    matches directly, so matches can't be faked)."""
+    """Returns True if this like created a match. The match row is created by the database trigger from arovi_supabase_setup.sql (clients are not allowed to insert matches directly, so matches can't be faked)."""
     sender_id = str(sender_id)
     receiver_id = str(receiver_id)
 
@@ -272,7 +275,11 @@ def create_like(sender_id, receiver_id):
 
     receiver = get_profile(receiver_id)
 
-    if not receiver or receiver.get("is_active") is False:
+    if (
+        not receiver
+        or receiver.get("is_active") is False
+        or is_blocked(receiver)
+    ):
         raise ValueError("This profile is unavailable.")
 
     api().table("likes").upsert(
@@ -334,6 +341,28 @@ def save_message(sender_id, receiver_id, message):
     }).execute()
 
     return True
+
+
+# ============================================================
+# REPORTS (user side)
+# ============================================================
+
+REPORT_REASONS = [
+    "Fake profile or scam",
+    "Harassment or abusive messages",
+    "Inappropriate photos",
+    "Under 18",
+    "Spam or advertising",
+    "Other",
+]
+
+
+def submit_report(reporter_id, reported_id, reason):
+    api().table("reports").insert({
+        "reporter_id": str(reporter_id),
+        "reported_id": str(reported_id),
+        "reason": (reason or "").strip()[:1000],
+    }).execute()
 
 
 # ============================================================
@@ -510,6 +539,147 @@ def delete_photo(user_id, photo):
 
 
 # ============================================================
+# ADMIN DATABASE FUNCTIONS
+# Every write goes through an admin_* SQL function that checks
+# is_admin() on the server, so the app UI is not what protects data.
+# ============================================================
+
+def check_admin(user_id):
+    rows = (
+        api().table("profiles")
+        .select("is_admin")
+        .eq("id", str(user_id))
+        .limit(1)
+        .execute()
+        .data or []
+    )
+
+    return bool(rows and rows[0].get("is_admin"))
+
+
+def admin_count(table, **equals):
+    query = api().table(table).select("*", count="exact")
+
+    for key, value in equals.items():
+        query = query.eq(key, value)
+
+    return query.limit(1).execute().count or 0
+
+
+def admin_list_users(search=""):
+    rows = (
+        api().table("profiles")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(150)
+        .execute()
+        .data or []
+    )
+
+    needle = norm(search)
+
+    if needle:
+        rows = [
+            r for r in rows
+            if needle in norm(" ".join(
+                str(r.get(k) or "")
+                for k in ("name", "email", "location")
+            ))
+        ]
+
+    attach_avatars(rows)
+
+    return rows
+
+
+def admin_set_status(user_id, status):
+    api().rpc(
+        "admin_set_status",
+        {"target": str(user_id), "new_status": status},
+    ).execute()
+
+
+def admin_delete_user(user_id):
+    photo_rows = (
+        api().table("profile_photos")
+        .select("path")
+        .eq("user_id", str(user_id))
+        .execute()
+        .data or []
+    )
+
+    paths = [r["path"] for r in photo_rows if r.get("path")]
+
+    api().rpc(
+        "admin_delete_user",
+        {"target": str(user_id)},
+    ).execute()
+
+    if paths:
+        try:
+            api().storage.from_(PHOTO_BUCKET).remove(paths)
+        except Exception:
+            pass
+
+
+def admin_remove_photo(photo):
+    api().rpc(
+        "admin_remove_photo",
+        {"photo_id": str(photo["id"])},
+    ).execute()
+
+    try:
+        api().storage.from_(PHOTO_BUCKET).remove([photo["path"]])
+    except Exception:
+        pass
+
+    _url_cache.pop(photo["path"], None)
+
+
+def admin_resolve_report(report_id, status):
+    api().rpc(
+        "admin_resolve_report",
+        {"rid": str(report_id), "new_status": status},
+    ).execute()
+
+
+def admin_open_reports():
+    reports = (
+        api().table("reports")
+        .select("*")
+        .eq("status", "open")
+        .order("created_at", desc=True)
+        .limit(100)
+        .execute()
+        .data or []
+    )
+
+    ids = list({
+        str(r[key])
+        for r in reports
+        for key in ("reporter_id", "reported_id")
+    })
+
+    names = {}
+
+    if ids:
+        people = (
+            api().table("profiles")
+            .select("id,name,email")
+            .in_("id", ids)
+            .execute()
+            .data or []
+        )
+
+        for p in people:
+            names[str(p["id"])] = (
+                p.get("name") or p.get("email") or "AROVI member"
+            )
+
+    return reports, names
+
+
+# ============================================================
 # FLET APPLICATION
 # ============================================================
 
@@ -535,8 +705,19 @@ def main(page: ft.Page):
     current_tab = "Discover"
     active_notice = None
 
-    # Discover queue, chat poller token, and which user the queue is for
-    state = {"queue": None, "index": 0, "chat_token": 0, "user": None}
+    # Discover queue, chat poller token, and which user the queue is for.
+    # admin_mode = hidden admin login was unlocked on the login page
+    # admin = this session is a verified admin using the dashboard
+    state = {
+        "queue": None,
+        "index": 0,
+        "chat_token": 0,
+        "user": None,
+        "admin_mode": False,
+        "admin": False,
+        "atab": "Overview",
+        "asearch": "",
+    }
 
     # ========================================================
     # REUSABLE UI COMPONENTS
@@ -859,7 +1040,7 @@ def main(page: ft.Page):
         if person.get("location"):
             parts.append(person["location"])
 
-        return "  •  ".join(parts)
+        return " â€¢ ".join(parts)
 
     def person_row(person, subtitle, on_tap):
         return ft.Container(
@@ -937,7 +1118,7 @@ def main(page: ft.Page):
             wide_button("TRY AGAIN", lambda e: retry()),
         ])
 
-    def show_screen(content, navigation=False):
+    def show_screen(content, navigation=False, nav=None):
         page.clean()
         page.bgcolor = BG
         page.padding = 0
@@ -950,7 +1131,9 @@ def main(page: ft.Page):
             )
         ]
 
-        if navigation and current_user_id:
+        if nav is not None:
+            items.append(nav)
+        elif navigation and current_user_id:
             items.append(build_bottom_navigation())
 
         page.add(
@@ -973,20 +1156,12 @@ def main(page: ft.Page):
         current_tab = tab
         open_dashboard()
 
-    def build_bottom_navigation():
-
-        tabs = [
-            ("Discover", ft.Icons.EXPLORE_OUTLINED),
-            ("Matches", ft.Icons.FAVORITE_BORDER),
-            ("Messages", ft.Icons.CHAT_BUBBLE_OUTLINE),
-            ("Profile", ft.Icons.PERSON_OUTLINE),
-        ]
-
+    def build_nav(tabs, selected_name, on_select):
         buttons = []
 
         for tab_name, tab_icon in tabs:
 
-            selected = current_tab == tab_name
+            selected = selected_name == tab_name
 
             buttons.append(
                 ft.Container(
@@ -1010,7 +1185,7 @@ def main(page: ft.Page):
                             ),
                             spacing=2,
                         ),
-                        on_click=lambda e, t=tab_name: set_tab(t),
+                        on_click=lambda e, t=tab_name: on_select(t),
                     ),
                 )
             )
@@ -1022,6 +1197,19 @@ def main(page: ft.Page):
                 controls=buttons,
                 alignment=ft.MainAxisAlignment.SPACE_AROUND,
             ),
+        )
+
+    def build_bottom_navigation():
+
+        return build_nav(
+            [
+                ("Discover", ft.Icons.EXPLORE_OUTLINED),
+                ("Matches", ft.Icons.FAVORITE_BORDER),
+                ("Messages", ft.Icons.CHAT_BUBBLE_OUTLINE),
+                ("Profile", ft.Icons.PERSON_OUTLINE),
+            ],
+            current_tab,
+            set_tab,
         )
 
     # ========================================================
@@ -1137,7 +1325,7 @@ def main(page: ft.Page):
                     show_login,
                 ),
                 ft.Text(
-                    "18+ ONLY  •  RESPECT  •  HONEST CONNECTIONS",
+                    "18+ ONLY â€¢ RESPECT â€¢ HONEST CONNECTIONS",
                     size=10,
                     color=MUTED,
                     text_align=ft.TextAlign.CENTER,
@@ -1331,12 +1519,32 @@ def main(page: ft.Page):
         show_screen(content)
 
     # ========================================================
-    # LOGIN
+    # LOGIN (tap the AROVI logo 3 times to unlock admin sign-in)
     # ========================================================
 
     def show_login(e=None):
 
         notice = make_notice()
+
+        state["admin_mode"] = False
+        taps = {"count": 0}
+
+        admin_tag = ft.Text(
+            "ADMIN SIGN-IN",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color=GOLD,
+            visible=False,
+        )
+
+        def logo_tap(e):
+            taps["count"] += 1
+
+            if taps["count"] >= 3:
+                taps["count"] = 0
+                state["admin_mode"] = True
+                admin_tag.visible = True
+                page.update()
 
         email = field(
             "Email address",
@@ -1385,6 +1593,33 @@ def main(page: ft.Page):
                     )
                     return
 
+                if is_blocked(profile):
+
+                    api().auth.sign_out()
+                    current_user_id = None
+
+                    notify(
+                        "This account has been suspended or banned. "
+                        "Contact AROVI support if you think this is a mistake."
+                    )
+                    return
+
+                if state.get("admin_mode"):
+
+                    if not profile.get("is_admin"):
+
+                        api().auth.sign_out()
+                        current_user_id = None
+                        state["admin_mode"] = False
+
+                        notify("This account is not authorized.")
+                        return
+
+                    state["admin"] = True
+                    state["atab"] = "Overview"
+                    open_admin()
+                    return
+
                 current_tab = "Discover"
                 open_dashboard()
 
@@ -1396,7 +1631,11 @@ def main(page: ft.Page):
             alignment=ft.MainAxisAlignment.CENTER,
             spacing=15,
             controls=[
-                app_logo(34),
+                ft.Container(
+                    content=app_logo(34),
+                    on_click=logo_tap,
+                ),
+                admin_tag,
                 heading(
                     "Welcome back",
                     "Sign in to continue your journey.",
@@ -1429,6 +1668,11 @@ def main(page: ft.Page):
             show_welcome()
             return
 
+        # verified admin sessions use the admin dashboard
+        if state.get("admin"):
+            open_admin()
+            return
+
         # a different user signed in -> start with a fresh Discover queue
         if state["user"] != current_user_id:
             state.update(queue=None, index=0, user=current_user_id)
@@ -1458,6 +1702,23 @@ def main(page: ft.Page):
             show_welcome()
             return
 
+        if is_blocked(user):
+
+            try:
+                api().auth.sign_out()
+            except Exception:
+                pass
+
+            current_user_id = None
+            state.update(queue=None, index=0, user=None)
+
+            show_welcome()
+            notify(
+                "This account has been suspended or banned. "
+                "Contact AROVI support if you think this is a mistake."
+            )
+            return
+
         if current_tab == "Discover":
             show_discover()
 
@@ -1472,6 +1733,66 @@ def main(page: ft.Page):
 
         else:
             show_discover()
+
+    # ========================================================
+    # REPORT A MEMBER
+    # ========================================================
+
+    def show_report(person_id, person_name, back):
+
+        notice = make_notice()
+
+        reason = ft.Dropdown(
+            label="Reason",
+            options=[ft.dropdown.Option(r) for r in REPORT_REASONS],
+        )
+
+        details = ft.TextField(
+            label="Details (optional)",
+            multiline=True,
+            min_lines=3,
+            max_lines=5,
+            filled=True,
+            bgcolor=WHITE,
+            border_radius=12,
+        )
+
+        def submit(e):
+
+            if not reason.value:
+                notify("Choose a reason first.")
+                return
+
+            extra = (details.value or "").strip()
+            text = reason.value + (f": {extra}" if extra else "")
+
+            try:
+                submit_report(current_user_id, person_id, text)
+            except Exception as ex:
+                notify(f"Could not send report: {ex}")
+                return
+
+            back()
+            notify(
+                "Thank you. Our team will review your report.",
+                GREEN,
+            )
+
+        show_screen(
+            make_scrollable([
+                app_logo(25),
+                heading(
+                    f"Report {person_name}",
+                    "Tell us what is wrong. Reports are reviewed "
+                    "by the AROVI team.",
+                ),
+                reason,
+                details,
+                notice,
+                wide_button("SEND REPORT", submit),
+                secondary_button("CANCEL", lambda e: back()),
+            ])
+        )
 
     # ========================================================
     # DISCOVER
@@ -1651,6 +1972,11 @@ def main(page: ft.Page):
             state["index"] += 1
             show_discover()
 
+        def after_report():
+            # move past the reported profile
+            state["index"] += 1
+            show_discover()
+
         card_controls = [
             gallery_view(person_photos, person),
             ft.Text(
@@ -1718,6 +2044,20 @@ def main(page: ft.Page):
             ],
         )
 
+        report_row = ft.Row(
+            alignment=ft.MainAxisAlignment.CENTER,
+            controls=[
+                ft.TextButton(
+                    content="Report this profile",
+                    on_click=lambda e: show_report(
+                        person["id"],
+                        display_name(person),
+                        after_report,
+                    ),
+                )
+            ],
+        )
+
         show_screen(
             make_scrollable([
                 header,
@@ -1737,6 +2077,7 @@ def main(page: ft.Page):
                 ),
                 notice,
                 actions,
+                report_row,
             ]),
             navigation=True,
         )
@@ -1862,7 +2203,7 @@ def main(page: ft.Page):
                     )
                     preview = ("You: " if mine else "") + last["message"]
                 else:
-                    preview = "Say hello 👋"
+                    preview = "Say hello ðŸ‘‹"
 
                 controls.append(
                     person_row(
@@ -1894,6 +2235,7 @@ def main(page: ft.Page):
 
             if (
                 not person
+                or is_blocked(person)
                 or not is_matched(
                     current_user_id,
                     other_user_id,
@@ -1970,7 +2312,7 @@ def main(page: ft.Page):
                         padding=20,
                         alignment=ft.Alignment.CENTER,
                         content=ft.Text(
-                            "You matched! Say hello 👋",
+                            "You matched! Say hello ðŸ‘‹",
                             color=MUTED,
                             text_align=ft.TextAlign.CENTER,
                         ),
@@ -2067,6 +2409,19 @@ def main(page: ft.Page):
                                             color=GREEN,
                                         ),
                                     ],
+                                ),
+                                ft.IconButton(
+                                    icon=ft.Icons.FLAG_OUTLINED,
+                                    icon_color=MUTED,
+                                    tooltip="Report",
+                                    on_click=lambda e: show_report(
+                                        other_user_id,
+                                        display_name(person),
+                                        lambda: open_chat(
+                                            other_user_id,
+                                            origin_tab,
+                                        ),
+                                    ),
                                 ),
                             ]
                         ),
@@ -2269,7 +2624,13 @@ def main(page: ft.Page):
 
             current_user_id = None
             current_tab = "Discover"
-            state.update(queue=None, index=0, user=None)
+            state.update(
+                queue=None,
+                index=0,
+                user=None,
+                admin=False,
+                admin_mode=False,
+            )
 
             show_welcome()
 
@@ -2495,12 +2856,17 @@ def main(page: ft.Page):
                 save_profile,
             ),
             ft.OutlinedButton(
+                content="CHANGE PASSWORD",
+                icon=ft.Icons.LOCK_OUTLINE,
+                on_click=lambda e: show_change_password(show_profile),
+            ),
+            ft.OutlinedButton(
                 content="LOG OUT",
                 icon=ft.Icons.LOGOUT,
                 on_click=logout,
             ),
             ft.Text(
-                "AROVI • 18+ COMMUNITY",
+                "AROVI â€¢ 18+ COMMUNITY",
                 size=10,
                 color=MUTED,
                 text_align=ft.TextAlign.CENTER,
@@ -2511,6 +2877,815 @@ def main(page: ft.Page):
             content,
             navigation=True,
         )
+
+    # ========================================================
+    # CHANGE PASSWORD (members and admins)
+    # ========================================================
+
+    def show_change_password(back):
+
+        notice = make_notice()
+
+        current = field("Current password", password=True)
+        fresh = field("New password", password=True)
+        confirm = field("Confirm new password", password=True)
+
+        def save(e):
+
+            old = current.value or ""
+            new = fresh.value or ""
+
+            if not old or not new:
+                notify("Fill in all the fields.")
+                return
+
+            if len(new) < 8:
+                notify("New password must be at least 8 characters.")
+                return
+
+            if new != (confirm.value or ""):
+                notify("The new passwords do not match.")
+                return
+
+            if new == old:
+                notify("Choose a password different from the current one.")
+                return
+
+            # confirm the current password first
+            try:
+                profile = get_profile(current_user_id) or {}
+                mail = profile.get("email") or ""
+
+                if not mail:
+                    mail = getattr(get_auth_user(), "email", "") or ""
+
+                api().auth.sign_in_with_password({
+                    "email": mail,
+                    "password": old,
+                })
+            except Exception:
+                notify("Your current password is incorrect.")
+                return
+
+            try:
+                api().auth.update_user({"password": new})
+            except Exception as ex:
+                notify(f"Could not change password: {ex}")
+                return
+
+            back()
+            notify("Password changed.", GREEN)
+
+        is_admin_session = bool(state.get("admin"))
+
+        show_screen(
+            make_scrollable([
+                app_logo(25),
+                heading(
+                    "Change password",
+                    "Enter your current password, then choose a new one.",
+                ),
+                current,
+                fresh,
+                confirm,
+                notice,
+                wide_button("SAVE NEW PASSWORD", save),
+                secondary_button("CANCEL", lambda e: back()),
+            ]),
+            navigation=not is_admin_session,
+            nav=admin_nav() if is_admin_session else None,
+        )
+
+    # ========================================================
+    # ADMIN DASHBOARD
+    # Reached only through the hidden admin sign-in, and only when
+    # the database says is_admin = true for the signed-in account.
+    # ========================================================
+
+    def set_atab(tab):
+        state["atab"] = tab
+        open_admin()
+
+    def admin_nav():
+        return build_nav(
+            [
+                ("Overview", ft.Icons.DASHBOARD_OUTLINED),
+                ("Users", ft.Icons.PEOPLE_OUTLINE),
+                ("Reports", ft.Icons.FLAG_OUTLINED),
+            ],
+            state.get("atab", "Overview"),
+            set_atab,
+        )
+
+    def admin_screen(content):
+        show_screen(content, nav=admin_nav())
+
+    def admin_error(title, ex, retry):
+        show_screen(error_view(title, ex, retry), nav=admin_nav())
+
+    def admin_logout(e=None):
+
+        nonlocal current_user_id, current_tab
+
+        try:
+            api().auth.sign_out()
+        except Exception:
+            pass
+
+        current_user_id = None
+        current_tab = "Discover"
+        state.update(
+            queue=None,
+            index=0,
+            user=None,
+            admin=False,
+            admin_mode=False,
+            atab="Overview",
+            asearch="",
+        )
+
+        show_welcome()
+
+    def admin_header(title, subtitle=None):
+        return ft.Row(
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            controls=[
+                ft.Column(
+                    expand=True,
+                    spacing=4,
+                    controls=[
+                        ft.Text(
+                            "AROVI ADMIN",
+                            size=11,
+                            weight=ft.FontWeight.BOLD,
+                            color=GOLD,
+                        ),
+                        heading(title, subtitle),
+                    ],
+                ),
+                ft.Row(
+                    spacing=0,
+                    controls=[
+                        ft.IconButton(
+                            icon=ft.Icons.LOCK_RESET,
+                            icon_color=PRIMARY,
+                            tooltip="Change password",
+                            on_click=lambda e: show_change_password(
+                                open_admin
+                            ),
+                        ),
+                        ft.IconButton(
+                            icon=ft.Icons.LOGOUT,
+                            icon_color=PRIMARY,
+                            tooltip="Sign out",
+                            on_click=admin_logout,
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+    def admin_run(action, ok_message, after):
+        """Run an admin action, rebuild the screen, then show the result."""
+        try:
+            action()
+        except Exception as ex:
+            after()
+            notify(f"Failed: {ex}")
+            return
+
+        after()
+        notify(ok_message, GREEN)
+
+    def admin_confirm(title, message, yes_label, on_yes, back):
+
+        show_screen(
+            ft.Column(
+                expand=True,
+                alignment=ft.MainAxisAlignment.CENTER,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=16,
+                controls=[
+                    centered_icon(ft.Icons.WARNING_AMBER_ROUNDED),
+                    ft.Text(
+                        title,
+                        size=20,
+                        weight=ft.FontWeight.BOLD,
+                        color=DARK,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    ft.Text(
+                        message,
+                        size=13,
+                        color=MUTED,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    wide_button(yes_label, lambda e: on_yes()),
+                    secondary_button("CANCEL", lambda e: back()),
+                ],
+            ),
+            nav=admin_nav(),
+        )
+
+    def open_admin():
+
+        nonlocal current_user_id
+
+        state["chat_token"] += 1
+
+        if not current_user_id:
+            show_welcome()
+            return
+
+        try:
+            allowed = check_admin(current_user_id)
+        except Exception as ex:
+            show_screen(
+                error_view("Connection problem", ex, open_admin)
+            )
+            return
+
+        if not allowed:
+
+            try:
+                api().auth.sign_out()
+            except Exception:
+                pass
+
+            current_user_id = None
+            state.update(admin=False, admin_mode=False)
+
+            show_welcome()
+            return
+
+        tab = state.get("atab", "Overview")
+
+        if tab == "Users":
+            admin_users()
+        elif tab == "Reports":
+            admin_reports()
+        else:
+            admin_overview()
+
+    # ---------- overview ----------
+
+    def admin_overview():
+
+        try:
+            stats = [
+                ("Members", admin_count("profiles")),
+                ("Active", admin_count("profiles", status="active")),
+                ("Suspended", admin_count("profiles", status="suspended")),
+                ("Banned", admin_count("profiles", status="banned")),
+                ("Likes", admin_count("likes")),
+                ("Matches", admin_count("matches")),
+                ("Messages", admin_count("messages")),
+                ("Open reports", admin_count("reports", status="open")),
+            ]
+        except Exception as ex:
+            admin_error("Could not load overview", ex, admin_overview)
+            return
+
+        tiles = [
+            ft.Container(
+                width=150,
+                bgcolor=WHITE,
+                border_radius=16,
+                padding=14,
+                content=ft.Column(
+                    spacing=2,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Text(
+                            str(value),
+                            size=26,
+                            weight=ft.FontWeight.BOLD,
+                            color=PRIMARY,
+                        ),
+                        ft.Text(label, size=12, color=MUTED),
+                    ],
+                ),
+            )
+            for label, value in stats
+        ]
+
+        admin_screen(
+            make_scrollable([
+                admin_header("Overview", "How AROVI is doing right now."),
+                ft.Row(
+                    wrap=True,
+                    spacing=10,
+                    run_spacing=10,
+                    controls=tiles,
+                ),
+                make_notice(),
+                wide_button("REFRESH", lambda e: admin_overview()),
+            ])
+        )
+
+    # ---------- users ----------
+
+    def admin_users(search=None):
+
+        if search is not None:
+            state["asearch"] = search
+
+        query = state.get("asearch", "")
+
+        try:
+            people = admin_list_users(query)
+        except Exception as ex:
+            admin_error("Could not load users", ex, admin_users)
+            return
+
+        search_field = ft.TextField(
+            hint_text="Search name, email or city (press Enter)",
+            value=query,
+            filled=True,
+            bgcolor=WHITE,
+            border_radius=12,
+            text_size=14,
+            on_submit=lambda e: admin_users(e.control.value or ""),
+        )
+
+        controls = [
+            admin_header("Users", f"{len(people)} shown"),
+            search_field,
+            make_notice(),
+        ]
+
+        if not people:
+            controls.append(
+                empty_view(
+                    ft.Icons.PEOPLE_OUTLINE,
+                    "No users found",
+                    "Try a different search.",
+                )
+            )
+
+        for person in people:
+
+            tags = [norm(person.get("status")) or "active"]
+
+            if person.get("is_admin"):
+                tags.append("admin")
+
+            if person.get("is_active") is False:
+                tags.append("hidden")
+
+            subtitle = " â€¢ ".join(
+                [" / ".join(t.title() for t in tags)]
+                + ([person_subtitle(person)] if person_subtitle(person) else [])
+            )
+
+            controls.append(
+                person_row(
+                    person,
+                    subtitle,
+                    lambda e, uid=person["id"]: admin_user_detail(uid),
+                )
+            )
+
+        admin_screen(make_scrollable(controls))
+
+    def admin_user_detail(user_id, back=None):
+
+        back = back or admin_users
+
+        try:
+            person = get_profile(user_id)
+            photos = get_photos(user_id) if person else []
+        except Exception as ex:
+            admin_error("Could not load this user", ex, back)
+            return
+
+        if not person:
+            back()
+            return
+
+        notice = make_notice()
+
+        status = norm(person.get("status")) or "active"
+        target_is_admin = bool(person.get("is_admin"))
+        is_self = str(user_id) == str(current_user_id)
+        name = display_name(person)
+
+        def refresh():
+            admin_user_detail(user_id, back)
+
+        def delete_it():
+            admin_run(
+                lambda: admin_delete_user(user_id),
+                "User deleted.",
+                admin_users,
+            )
+
+        def ban_it():
+            admin_run(
+                lambda: admin_set_status(user_id, "banned"),
+                "User banned.",
+                refresh,
+            )
+
+        def remove_photo(photo):
+            admin_run(
+                lambda: admin_remove_photo(photo),
+                "Photo removed.",
+                refresh,
+            )
+
+        def info(label, value):
+            return ft.Row(
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                controls=[
+                    ft.Text(label, size=13, color=MUTED),
+                    ft.Text(
+                        str(value or "-"),
+                        size=13,
+                        color=DARK,
+                        text_align=ft.TextAlign.RIGHT,
+                        expand=True,
+                    ),
+                ],
+            )
+
+        details = panel(
+            ft.Column(
+                spacing=8,
+                controls=[
+                    info("Email", person.get("email")),
+                    info("Age", person.get("age")),
+                    info("Gender", person.get("gender")),
+                    info("Interested in", person.get("interested_in")),
+                    info("Location", person.get("location")),
+                    info("Status", status.title()),
+                    info(
+                        "Visible in Discover",
+                        "No" if person.get("is_active") is False else "Yes",
+                    ),
+                    info("Joined", str(person.get("created_at") or "")[:10]),
+                    ft.Text(
+                        (person.get("bio") or "No bio.").strip(),
+                        size=13,
+                        color=DARK,
+                    ),
+                ],
+            )
+        )
+
+        def photo_tile(index, photo):
+            return ft.Column(
+                spacing=0,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Container(
+                        width=104,
+                        height=104,
+                        border_radius=12,
+                        bgcolor=LIGHT_PINK,
+                        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                        on_click=lambda e: show_photo_viewer(
+                            [p["url"] for p in photos],
+                            index,
+                        ),
+                        content=ft.Image(
+                            src=photo["url"],
+                            width=104,
+                            height=104,
+                            fit=FIT_COVER,
+                        ),
+                    ),
+                    ft.TextButton(
+                        content="Remove",
+                        on_click=lambda e, p=photo: admin_confirm(
+                            "Remove this photo?",
+                            "The photo is deleted for everyone.",
+                            "REMOVE PHOTO",
+                            lambda: remove_photo(p),
+                            refresh,
+                        ),
+                    ),
+                ],
+            )
+
+        photo_block = panel(
+            ft.Column(
+                spacing=10,
+                controls=[
+                    ft.Text(
+                        f"Photos ({len(photos)})",
+                        size=16,
+                        weight=ft.FontWeight.BOLD,
+                        color=DARK,
+                    ),
+                    (
+                        ft.Row(
+                            wrap=True,
+                            spacing=10,
+                            run_spacing=6,
+                            controls=[
+                                photo_tile(i, p)
+                                for i, p in enumerate(photos)
+                            ],
+                        )
+                        if photos
+                        else ft.Text(
+                            "No photos.",
+                            size=13,
+                            color=MUTED,
+                        )
+                    ),
+                ],
+            )
+        )
+
+        actions = []
+
+        if target_is_admin or is_self:
+            actions.append(
+                ft.Text(
+                    "Admin accounts cannot be changed here.",
+                    size=12,
+                    color=MUTED,
+                )
+            )
+        else:
+            if status == "active":
+                actions.append(
+                    wide_button(
+                        "SUSPEND",
+                        lambda e: admin_run(
+                            lambda: admin_set_status(user_id, "suspended"),
+                            "User suspended.",
+                            refresh,
+                        ),
+                    )
+                )
+                actions.append(
+                    wide_button(
+                        "BAN",
+                        lambda e: admin_confirm(
+                            f"Ban {name}?",
+                            "They will be signed out and unable to sign in.",
+                            "BAN USER",
+                            ban_it,
+                            refresh,
+                        ),
+                    )
+                )
+            else:
+                actions.append(
+                    wide_button(
+                        "REACTIVATE",
+                        lambda e: admin_run(
+                            lambda: admin_set_status(user_id, "active"),
+                            "User reactivated.",
+                            refresh,
+                        ),
+                    )
+                )
+
+            actions.append(
+                ft.OutlinedButton(
+                    content="DELETE ACCOUNT",
+                    icon=ft.Icons.DELETE_FOREVER,
+                    on_click=lambda e: admin_confirm(
+                        f"Delete {name}?",
+                        "This permanently deletes the account, photos, "
+                        "likes, matches and messages. It cannot be undone.",
+                        "DELETE FOREVER",
+                        delete_it,
+                        refresh,
+                    ),
+                )
+            )
+
+        admin_screen(
+            make_scrollable([
+                ft.Row(
+                    controls=[
+                        ft.IconButton(
+                            icon=ft.Icons.ARROW_BACK,
+                            icon_color=PRIMARY,
+                            on_click=lambda e: back(),
+                        ),
+                        person_avatar(52, person),
+                        ft.Column(
+                            expand=True,
+                            spacing=2,
+                            controls=[
+                                ft.Text(
+                                    name,
+                                    size=18,
+                                    weight=ft.FontWeight.BOLD,
+                                    color=DARK,
+                                ),
+                                ft.Text(
+                                    status.title()
+                                    + (" â€¢ Admin" if target_is_admin else ""),
+                                    size=12,
+                                    color=MUTED,
+                                ),
+                            ],
+                        ),
+                    ]
+                ),
+                details,
+                photo_block,
+                notice,
+                *actions,
+            ])
+        )
+
+    # ---------- reports ----------
+
+    def admin_view_chat(first_id, second_id, names):
+
+        try:
+            messages = get_conversation(first_id, second_id)
+        except Exception as ex:
+            admin_error("Could not load conversation", ex, admin_reports)
+            return
+
+        controls = [
+            ft.Row(
+                controls=[
+                    ft.IconButton(
+                        icon=ft.Icons.ARROW_BACK,
+                        icon_color=PRIMARY,
+                        on_click=lambda e: admin_reports(),
+                    ),
+                    ft.Text(
+                        "Reported conversation",
+                        size=18,
+                        weight=ft.FontWeight.BOLD,
+                        color=DARK,
+                    ),
+                ]
+            ),
+            ft.Text(
+                "Only open this to review a report. Private messages "
+                "are confidential.",
+                size=12,
+                color=MUTED,
+            ),
+        ]
+
+        if not messages:
+            controls.append(
+                ft.Text("No messages between these members.", color=MUTED)
+            )
+
+        for msg in messages:
+
+            sender = names.get(str(msg.get("sender_id")), "Member")
+
+            controls.append(
+                ft.Column(
+                    spacing=2,
+                    controls=[
+                        ft.Text(
+                            f"{sender} â€¢ "
+                            f"{str(msg.get('created_at') or '')[:16].replace('T', ' ')}",
+                            size=11,
+                            color=MUTED,
+                        ),
+                        ft.Container(
+                            bgcolor=WHITE,
+                            border_radius=12,
+                            padding=10,
+                            content=ft.Text(
+                                msg.get("message", ""),
+                                size=13,
+                                color=DARK,
+                                selectable=True,
+                            ),
+                        ),
+                    ],
+                )
+            )
+
+        admin_screen(make_scrollable(controls))
+
+    def admin_reports():
+
+        try:
+            reports, names = admin_open_reports()
+        except Exception as ex:
+            admin_error("Could not load reports", ex, admin_reports)
+            return
+
+        def dismiss(report):
+            admin_run(
+                lambda: admin_resolve_report(report["id"], "dismissed"),
+                "Report dismissed.",
+                admin_reports,
+            )
+
+        def sanction(report, status):
+            def action():
+                admin_set_status(report["reported_id"], status)
+                admin_resolve_report(report["id"], "resolved")
+
+            admin_run(
+                action,
+                f"User {status} and report resolved.",
+                admin_reports,
+            )
+
+        controls = [
+            admin_header(
+                "Reports",
+                f"{len(reports)} open",
+            ),
+            make_notice(),
+        ]
+
+        if not reports:
+            controls.append(
+                empty_view(
+                    ft.Icons.FLAG_OUTLINED,
+                    "No open reports",
+                    "New reports from members will appear here.",
+                )
+            )
+
+        for report in reports:
+
+            target = str(report["reported_id"])
+            reporter = str(report["reporter_id"])
+
+            controls.append(
+                panel(
+                    ft.Column(
+                        spacing=6,
+                        controls=[
+                            ft.Text(
+                                f"{names.get(target, 'Member')} was reported",
+                                size=15,
+                                weight=ft.FontWeight.BOLD,
+                                color=DARK,
+                            ),
+                            ft.Text(
+                                f"By {names.get(reporter, 'Member')} â€¢ "
+                                f"{str(report.get('created_at') or '')[:10]}",
+                                size=12,
+                                color=MUTED,
+                            ),
+                            ft.Text(
+                                report.get("reason") or "",
+                                size=13,
+                                color=DARK,
+                            ),
+                            ft.Row(
+                                wrap=True,
+                                spacing=0,
+                                controls=[
+                                    ft.TextButton(
+                                        content="Profile",
+                                        on_click=lambda e, t=target: admin_user_detail(
+                                            t,
+                                            admin_reports,
+                                        ),
+                                    ),
+                                    ft.TextButton(
+                                        content="Chat",
+                                        on_click=lambda e, a=reporter, b=target: admin_view_chat(
+                                            a,
+                                            b,
+                                            names,
+                                        ),
+                                    ),
+                                    ft.TextButton(
+                                        content="Dismiss",
+                                        on_click=lambda e, r=report: dismiss(r),
+                                    ),
+                                    ft.TextButton(
+                                        content="Suspend",
+                                        on_click=lambda e, r=report: sanction(
+                                            r,
+                                            "suspended",
+                                        ),
+                                    ),
+                                    ft.TextButton(
+                                        content="Ban",
+                                        on_click=lambda e, r=report: admin_confirm(
+                                            "Ban this member?",
+                                            "They will be banned and this "
+                                            "report marked resolved.",
+                                            "BAN USER",
+                                            lambda: sanction(r, "banned"),
+                                            admin_reports,
+                                        ),
+                                    ),
+                                ],
+                            ),
+                        ],
+                    )
+                )
+            )
+
+        admin_screen(make_scrollable(controls))
 
     # ========================================================
     # START APPLICATION
