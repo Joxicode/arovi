@@ -540,7 +540,7 @@ def delete_photo(user_id, photo):
 
 # ============================================================
 # ADMIN DATABASE FUNCTIONS
-# Every write goes through an admin_* SQL function that checks
+# Every call goes through an admin_* SQL function that checks
 # is_admin() on the server, so the app UI is not what protects data.
 # ============================================================
 
@@ -557,46 +557,64 @@ def check_admin(user_id):
     return bool(rows and rows[0].get("is_admin"))
 
 
-def admin_count(table, **equals):
-    query = api().table(table).select("*", count="exact")
-
-    for key, value in equals.items():
-        query = query.eq(key, value)
-
-    return query.limit(1).execute().count or 0
+def _rpc(name, params=None):
+    return api().rpc(name, params or {}).execute().data
 
 
-def admin_list_users(search=""):
-    rows = (
-        api().table("profiles")
-        .select("*")
-        .order("created_at", desc=True)
-        .limit(150)
-        .execute()
-        .data or []
-    )
+def admin_stats():
+    data = _rpc("admin_stats")
+    return data if isinstance(data, dict) else {}
 
-    needle = norm(search)
 
-    if needle:
-        rows = [
-            r for r in rows
-            if needle in norm(" ".join(
-                str(r.get(k) or "")
-                for k in ("name", "email", "location")
-            ))
-        ]
+def admin_list_users(search="", filter_by="all", skip=0, limit=20):
+    rows = _rpc("admin_list_users", {
+        "search_text": (search or "").strip(),
+        "filter_by": filter_by,
+        "skip_rows": int(skip),
+        "page_size": int(limit),
+    }) or []
 
     attach_avatars(rows)
 
     return rows
 
 
+def admin_user_summary(user_id):
+    data = _rpc("admin_user_summary", {"target": str(user_id)})
+    return data if isinstance(data, dict) else {}
+
+
+def admin_user_matches(user_id):
+    return _rpc("admin_user_matches", {"target": str(user_id)}) or []
+
+
+def admin_unmatch(match_id):
+    _rpc("admin_unmatch", {"match_id": str(match_id)})
+
+
 def admin_set_status(user_id, status):
-    api().rpc(
-        "admin_set_status",
-        {"target": str(user_id), "new_status": status},
-    ).execute()
+    _rpc("admin_set_status", {
+        "target": str(user_id),
+        "new_status": status,
+    })
+
+
+def admin_set_visibility(user_id, visible):
+    _rpc("admin_set_visibility", {
+        "target": str(user_id),
+        "visible": bool(visible),
+    })
+
+
+def admin_set_admin(user_id, make_admin):
+    _rpc("admin_set_admin", {
+        "target": str(user_id),
+        "make_admin": bool(make_admin),
+    })
+
+
+def admin_clear_bio(user_id):
+    _rpc("admin_clear_bio", {"target": str(user_id)})
 
 
 def admin_delete_user(user_id):
@@ -610,10 +628,7 @@ def admin_delete_user(user_id):
 
     paths = [r["path"] for r in photo_rows if r.get("path")]
 
-    api().rpc(
-        "admin_delete_user",
-        {"target": str(user_id)},
-    ).execute()
+    _rpc("admin_delete_user", {"target": str(user_id)})
 
     if paths:
         try:
@@ -622,11 +637,15 @@ def admin_delete_user(user_id):
             pass
 
 
+def admin_recent_photos(skip=0, limit=12):
+    return _rpc("admin_recent_photos", {
+        "skip_rows": int(skip),
+        "page_size": int(limit),
+    }) or []
+
+
 def admin_remove_photo(photo):
-    api().rpc(
-        "admin_remove_photo",
-        {"photo_id": str(photo["id"])},
-    ).execute()
+    _rpc("admin_remove_photo", {"photo_id": str(photo["id"])})
 
     try:
         api().storage.from_(PHOTO_BUCKET).remove([photo["path"]])
@@ -636,47 +655,22 @@ def admin_remove_photo(photo):
     _url_cache.pop(photo["path"], None)
 
 
+def admin_list_reports(filter_by="open"):
+    return _rpc("admin_list_reports", {"filter_by": filter_by}) or []
+
+
 def admin_resolve_report(report_id, status):
-    api().rpc(
-        "admin_resolve_report",
-        {"rid": str(report_id), "new_status": status},
-    ).execute()
-
-
-def admin_open_reports():
-    reports = (
-        api().table("reports")
-        .select("*")
-        .eq("status", "open")
-        .order("created_at", desc=True)
-        .limit(100)
-        .execute()
-        .data or []
-    )
-
-    ids = list({
-        str(r[key])
-        for r in reports
-        for key in ("reporter_id", "reported_id")
+    _rpc("admin_resolve_report", {
+        "rid": str(report_id),
+        "new_status": status,
     })
 
-    names = {}
 
-    if ids:
-        people = (
-            api().table("profiles")
-            .select("id,name,email")
-            .in_("id", ids)
-            .execute()
-            .data or []
-        )
-
-        for p in people:
-            names[str(p["id"])] = (
-                p.get("name") or p.get("email") or "AROVI member"
-            )
-
-    return reports, names
+def admin_get_conversation(first_id, second_id):
+    return _rpc("admin_get_conversation", {
+        "a": str(first_id),
+        "b": str(second_id),
+    }) or []
 
 
 # ============================================================
@@ -717,6 +711,10 @@ def main(page: ft.Page):
         "admin": False,
         "atab": "Overview",
         "asearch": "",
+        "afilter": "all",
+        "apage": 0,
+        "aphoto_page": 0,
+        "areport": "open",
     }
 
     # ========================================================
@@ -759,13 +757,19 @@ def main(page: ft.Page):
         )
 
     def primary_button(label, action):
-        return ft.Button(
-            content=label,
-            on_click=action,
-            bgcolor=PRIMARY,
-            color=WHITE,
-            height=48,
-            expand=True,
+        # Row-wrapped: expand=True then means full WIDTH (a bare expanded
+        # button inside a Column stretches to full height)
+        return ft.Row(
+            controls=[
+                ft.Button(
+                    content=label,
+                    on_click=action,
+                    bgcolor=PRIMARY,
+                    color=WHITE,
+                    height=48,
+                    expand=True,
+                )
+            ]
         )
 
     def secondary_button(label, action):
@@ -1040,7 +1044,7 @@ def main(page: ft.Page):
         if person.get("location"):
             parts.append(person["location"])
 
-        return " â€¢ ".join(parts)
+        return " \u2022 ".join(parts)
 
     def person_row(person, subtitle, on_tap):
         return ft.Container(
@@ -1325,7 +1329,7 @@ def main(page: ft.Page):
                     show_login,
                 ),
                 ft.Text(
-                    "18+ ONLY â€¢ RESPECT â€¢ HONEST CONNECTIONS",
+                    "18+ ONLY \u2022 RESPECT \u2022 HONEST CONNECTIONS",
                     size=10,
                     color=MUTED,
                     text_align=ft.TextAlign.CENTER,
@@ -2203,7 +2207,7 @@ def main(page: ft.Page):
                     )
                     preview = ("You: " if mine else "") + last["message"]
                 else:
-                    preview = "Say hello ðŸ‘‹"
+                    preview = "Say hello \U0001f44b"
 
                 controls.append(
                     person_row(
@@ -2312,7 +2316,7 @@ def main(page: ft.Page):
                         padding=20,
                         alignment=ft.Alignment.CENTER,
                         content=ft.Text(
-                            "You matched! Say hello ðŸ‘‹",
+                            "You matched! Say hello \U0001f44b",
                             color=MUTED,
                             text_align=ft.TextAlign.CENTER,
                         ),
@@ -2866,7 +2870,7 @@ def main(page: ft.Page):
                 on_click=logout,
             ),
             ft.Text(
-                "AROVI â€¢ 18+ COMMUNITY",
+                "AROVI \u2022 18+ COMMUNITY",
                 size=10,
                 color=MUTED,
                 text_align=ft.TextAlign.CENTER,
@@ -2962,6 +2966,8 @@ def main(page: ft.Page):
     # the database says is_admin = true for the signed-in account.
     # ========================================================
 
+    ADMIN_PAGE = 20
+
     def set_atab(tab):
         state["atab"] = tab
         open_admin()
@@ -2971,6 +2977,7 @@ def main(page: ft.Page):
             [
                 ("Overview", ft.Icons.DASHBOARD_OUTLINED),
                 ("Users", ft.Icons.PEOPLE_OUTLINE),
+                ("Photos", ft.Icons.PHOTO_LIBRARY_OUTLINED),
                 ("Reports", ft.Icons.FLAG_OUTLINED),
             ],
             state.get("atab", "Overview"),
@@ -3002,6 +3009,10 @@ def main(page: ft.Page):
             admin_mode=False,
             atab="Overview",
             asearch="",
+            afilter="all",
+            apage=0,
+            aphoto_page=0,
+            areport="open",
         )
 
         show_welcome()
@@ -3087,6 +3098,71 @@ def main(page: ft.Page):
             nav=admin_nav(),
         )
 
+    def outline_wide(label, action, icon=None):
+        return ft.Row(
+            controls=[
+                ft.OutlinedButton(
+                    content=label,
+                    icon=icon,
+                    on_click=action,
+                    expand=True,
+                )
+            ]
+        )
+
+    def chip(label, selected, on_tap):
+        return ft.Container(
+            bgcolor=PRIMARY if selected else WHITE,
+            border_radius=20,
+            padding=ft.Padding(left=14, top=7, right=14, bottom=7),
+            on_click=on_tap,
+            content=ft.Text(
+                label,
+                size=12,
+                weight=ft.FontWeight.BOLD,
+                color=WHITE if selected else DARK,
+            ),
+        )
+
+    def pager(page_number, has_next, go):
+        return ft.Row(
+            alignment=ft.MainAxisAlignment.CENTER,
+            controls=[
+                ft.TextButton(
+                    content="< Previous",
+                    visible=page_number > 0,
+                    on_click=lambda e: go(page_number - 1),
+                ),
+                ft.Text(
+                    f"Page {page_number + 1}",
+                    size=12,
+                    color=MUTED,
+                ),
+                ft.TextButton(
+                    content="Next >",
+                    visible=has_next,
+                    on_click=lambda e: go(page_number + 1),
+                ),
+            ],
+        )
+
+    def admin_subtitle(person):
+        tags = [(norm(person.get("status")) or "active").title()]
+
+        if person.get("is_admin"):
+            tags.append("Admin")
+
+        if person.get("is_active") is False:
+            tags.append("Hidden")
+
+        parts = [" / ".join(tags)]
+        extra = person_subtitle(person)
+
+        if extra:
+            parts.append(extra)
+
+        return " \u2022 ".join(parts)
+
     def open_admin():
 
         nonlocal current_user_id
@@ -3122,6 +3198,8 @@ def main(page: ft.Page):
 
         if tab == "Users":
             admin_users()
+        elif tab == "Photos":
+            admin_photos()
         elif tab == "Reports":
             admin_reports()
         else:
@@ -3132,19 +3210,27 @@ def main(page: ft.Page):
     def admin_overview():
 
         try:
-            stats = [
-                ("Members", admin_count("profiles")),
-                ("Active", admin_count("profiles", status="active")),
-                ("Suspended", admin_count("profiles", status="suspended")),
-                ("Banned", admin_count("profiles", status="banned")),
-                ("Likes", admin_count("likes")),
-                ("Matches", admin_count("matches")),
-                ("Messages", admin_count("messages")),
-                ("Open reports", admin_count("reports", status="open")),
-            ]
+            stats = admin_stats()
+            recent = admin_list_users("", "all", 0, 5)
         except Exception as ex:
             admin_error("Could not load overview", ex, admin_overview)
             return
+
+        items = [
+            ("Members", "members"),
+            ("New today", "new_today"),
+            ("New this week", "new_week"),
+            ("Active", "active"),
+            ("Suspended", "suspended"),
+            ("Banned", "banned"),
+            ("Hidden", "hidden"),
+            ("Admins", "admins"),
+            ("Photos", "photos"),
+            ("Likes", "likes"),
+            ("Matches", "matches"),
+            ("Messages", "messages"),
+            ("Open reports", "open_reports"),
+        ]
 
         tiles = [
             ft.Container(
@@ -3157,7 +3243,7 @@ def main(page: ft.Page):
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
                         ft.Text(
-                            str(value),
+                            str(stats.get(key, 0)),
                             size=26,
                             weight=ft.FontWeight.BOLD,
                             color=PRIMARY,
@@ -3166,37 +3252,75 @@ def main(page: ft.Page):
                     ],
                 ),
             )
-            for label, value in stats
+            for label, key in items
         ]
 
-        admin_screen(
-            make_scrollable([
-                admin_header("Overview", "How AROVI is doing right now."),
-                ft.Row(
-                    wrap=True,
-                    spacing=10,
-                    run_spacing=10,
-                    controls=tiles,
-                ),
-                make_notice(),
-                wide_button("REFRESH", lambda e: admin_overview()),
-            ])
-        )
+        controls = [
+            admin_header("Overview", "How AROVI is doing right now."),
+            ft.Row(
+                wrap=True,
+                spacing=10,
+                run_spacing=10,
+                controls=tiles,
+            ),
+            ft.Text(
+                "Newest members",
+                size=16,
+                weight=ft.FontWeight.BOLD,
+                color=DARK,
+            ),
+        ]
+
+        for person in recent:
+            controls.append(
+                person_row(
+                    person,
+                    admin_subtitle(person),
+                    lambda e, uid=person["id"]: admin_user_detail(
+                        uid,
+                        admin_overview,
+                    ),
+                )
+            )
+
+        controls.append(make_notice())
+        controls.append(wide_button("REFRESH", lambda e: admin_overview()))
+
+        admin_screen(make_scrollable(controls))
 
     # ---------- users ----------
 
-    def admin_users(search=None):
+    def admin_users(search=None, filter_by=None, page=None):
 
         if search is not None:
             state["asearch"] = search
+            state["apage"] = 0
+
+        if filter_by is not None:
+            state["afilter"] = filter_by
+            state["apage"] = 0
+
+        if page is not None:
+            state["apage"] = max(0, page)
 
         query = state.get("asearch", "")
+        current_filter = state.get("afilter", "all")
+        page_number = state.get("apage", 0)
 
         try:
-            people = admin_list_users(query)
+            rows = admin_list_users(
+                query,
+                current_filter,
+                page_number * ADMIN_PAGE,
+                ADMIN_PAGE + 1,
+            )
+            stats = admin_stats()
         except Exception as ex:
             admin_error("Could not load users", ex, admin_users)
             return
+
+        has_next = len(rows) > ADMIN_PAGE
+        rows = rows[:ADMIN_PAGE]
 
         search_field = ft.TextField(
             hint_text="Search name, email or city (press Enter)",
@@ -3205,44 +3329,64 @@ def main(page: ft.Page):
             bgcolor=WHITE,
             border_radius=12,
             text_size=14,
-            on_submit=lambda e: admin_users(e.control.value or ""),
+            on_submit=lambda e: admin_users(search=e.control.value or ""),
         )
 
+        filters = [
+            ("All", "all"),
+            ("Active", "active"),
+            ("Suspended", "suspended"),
+            ("Banned", "banned"),
+            ("Admins", "admins"),
+            ("Hidden", "hidden"),
+        ]
+
         controls = [
-            admin_header("Users", f"{len(people)} shown"),
+            admin_header(
+                "Users",
+                f"{stats.get('members', 0)} members in total",
+            ),
             search_field,
+            ft.Row(
+                wrap=True,
+                spacing=8,
+                run_spacing=8,
+                controls=[
+                    chip(
+                        label,
+                        current_filter == value,
+                        lambda e, v=value: admin_users(filter_by=v),
+                    )
+                    for label, value in filters
+                ],
+            ),
             make_notice(),
         ]
 
-        if not people:
+        if not rows:
             controls.append(
                 empty_view(
                     ft.Icons.PEOPLE_OUTLINE,
                     "No users found",
-                    "Try a different search.",
+                    "Try a different search or filter.",
                 )
             )
 
-        for person in people:
-
-            tags = [norm(person.get("status")) or "active"]
-
-            if person.get("is_admin"):
-                tags.append("admin")
-
-            if person.get("is_active") is False:
-                tags.append("hidden")
-
-            subtitle = " â€¢ ".join(
-                [" / ".join(t.title() for t in tags)]
-                + ([person_subtitle(person)] if person_subtitle(person) else [])
-            )
-
+        for person in rows:
             controls.append(
                 person_row(
                     person,
-                    subtitle,
+                    admin_subtitle(person),
                     lambda e, uid=person["id"]: admin_user_detail(uid),
+                )
+            )
+
+        if page_number > 0 or has_next:
+            controls.append(
+                pager(
+                    page_number,
+                    has_next,
+                    lambda n: admin_users(page=n),
                 )
             )
 
@@ -3254,13 +3398,21 @@ def main(page: ft.Page):
 
         try:
             person = get_profile(user_id)
-            photos = get_photos(user_id) if person else []
+
+            if not person:
+                back()
+                return
+
+            summary = admin_user_summary(user_id)
+            matches = admin_user_matches(user_id)
+
+            try:
+                photos = get_photos(user_id)
+            except Exception:
+                photos = []
+
         except Exception as ex:
             admin_error("Could not load this user", ex, back)
-            return
-
-        if not person:
-            back()
             return
 
         notice = make_notice()
@@ -3268,31 +3420,11 @@ def main(page: ft.Page):
         status = norm(person.get("status")) or "active"
         target_is_admin = bool(person.get("is_admin"))
         is_self = str(user_id) == str(current_user_id)
+        visible_now = person.get("is_active") is not False
         name = display_name(person)
 
         def refresh():
             admin_user_detail(user_id, back)
-
-        def delete_it():
-            admin_run(
-                lambda: admin_delete_user(user_id),
-                "User deleted.",
-                admin_users,
-            )
-
-        def ban_it():
-            admin_run(
-                lambda: admin_set_status(user_id, "banned"),
-                "User banned.",
-                refresh,
-            )
-
-        def remove_photo(photo):
-            admin_run(
-                lambda: admin_remove_photo(photo),
-                "Photo removed.",
-                refresh,
-            )
 
         def info(label, value):
             return ft.Row(
@@ -3300,7 +3432,7 @@ def main(page: ft.Page):
                 controls=[
                     ft.Text(label, size=13, color=MUTED),
                     ft.Text(
-                        str(value or "-"),
+                        str(value if value not in (None, "") else "-"),
                         size=13,
                         color=DARK,
                         text_align=ft.TextAlign.RIGHT,
@@ -3319,10 +3451,7 @@ def main(page: ft.Page):
                     info("Interested in", person.get("interested_in")),
                     info("Location", person.get("location")),
                     info("Status", status.title()),
-                    info(
-                        "Visible in Discover",
-                        "No" if person.get("is_active") is False else "Yes",
-                    ),
+                    info("Visible in Discover", "Yes" if visible_now else "No"),
                     info("Joined", str(person.get("created_at") or "")[:10]),
                     ft.Text(
                         (person.get("bio") or "No bio.").strip(),
@@ -3332,6 +3461,33 @@ def main(page: ft.Page):
                 ],
             )
         )
+
+        activity = panel(
+            ft.Column(
+                spacing=8,
+                controls=[
+                    ft.Text(
+                        "Activity",
+                        size=16,
+                        weight=ft.FontWeight.BOLD,
+                        color=DARK,
+                    ),
+                    info("Likes sent", summary.get("likes_sent", 0)),
+                    info("Likes received", summary.get("likes_received", 0)),
+                    info("Matches", summary.get("matches", 0)),
+                    info("Messages sent", summary.get("messages_sent", 0)),
+                    info("Reports against", summary.get("reports_against", 0)),
+                    info("Reports filed", summary.get("reports_filed", 0)),
+                ],
+            )
+        )
+
+        def remove_photo(photo):
+            admin_run(
+                lambda: admin_remove_photo(photo),
+                "Photo removed.",
+                refresh,
+            )
 
         def photo_tile(index, photo):
             return ft.Column(
@@ -3389,26 +3545,90 @@ def main(page: ft.Page):
                             ],
                         )
                         if photos
-                        else ft.Text(
-                            "No photos.",
-                            size=13,
-                            color=MUTED,
-                        )
+                        else ft.Text("No photos.", size=13, color=MUTED)
                     ),
                 ],
             )
         )
 
+        match_controls = [
+            ft.Text(
+                f"Matches ({len(matches)})",
+                size=16,
+                weight=ft.FontWeight.BOLD,
+                color=DARK,
+            )
+        ]
+
+        if not matches:
+            match_controls.append(
+                ft.Text("No matches.", size=13, color=MUTED)
+            )
+
+        for m in matches:
+            match_controls.append(
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    controls=[
+                        ft.TextButton(
+                            content=m.get("other_name") or "Member",
+                            on_click=lambda e, uid=m["other_id"]: admin_user_detail(
+                                uid,
+                                refresh,
+                            ),
+                        ),
+                        ft.TextButton(
+                            content="Unmatch",
+                            on_click=lambda e, mid=m["match_id"], n=m.get("other_name"): admin_confirm(
+                                "Unmatch these members?",
+                                f"{name} and {n or 'this member'} will no "
+                                "longer be matched and their chat is deleted.",
+                                "UNMATCH",
+                                lambda: admin_run(
+                                    lambda: admin_unmatch(mid),
+                                    "Unmatched.",
+                                    refresh,
+                                ),
+                                refresh,
+                            ),
+                        ),
+                    ],
+                )
+            )
+
+        match_block = panel(
+            ft.Column(spacing=4, controls=match_controls)
+        )
+
         actions = []
 
-        if target_is_admin or is_self:
+        if is_self:
             actions.append(
                 ft.Text(
-                    "Admin accounts cannot be changed here.",
+                    "This is your own admin account.",
                     size=12,
                     color=MUTED,
                 )
             )
+
+        elif target_is_admin:
+            actions.append(
+                outline_wide(
+                    "REMOVE ADMIN ROLE",
+                    lambda e: admin_confirm(
+                        f"Remove admin role from {name}?",
+                        "They become a normal member.",
+                        "REMOVE ADMIN",
+                        lambda: admin_run(
+                            lambda: admin_set_admin(user_id, False),
+                            "Admin role removed.",
+                            refresh,
+                        ),
+                        refresh,
+                    ),
+                )
+            )
+
         else:
             if status == "active":
                 actions.append(
@@ -3428,7 +3648,11 @@ def main(page: ft.Page):
                             f"Ban {name}?",
                             "They will be signed out and unable to sign in.",
                             "BAN USER",
-                            ban_it,
+                            lambda: admin_run(
+                                lambda: admin_set_status(user_id, "banned"),
+                                "User banned.",
+                                refresh,
+                            ),
                             refresh,
                         ),
                     )
@@ -3446,17 +3670,68 @@ def main(page: ft.Page):
                 )
 
             actions.append(
-                ft.OutlinedButton(
-                    content="DELETE ACCOUNT",
-                    icon=ft.Icons.DELETE_FOREVER,
-                    on_click=lambda e: admin_confirm(
+                outline_wide(
+                    "HIDE FROM DISCOVER" if visible_now else "SHOW IN DISCOVER",
+                    lambda e: admin_run(
+                        lambda: admin_set_visibility(user_id, not visible_now),
+                        "Visibility updated.",
+                        refresh,
+                    ),
+                )
+            )
+
+            if (person.get("bio") or "").strip():
+                actions.append(
+                    outline_wide(
+                        "CLEAR BIO",
+                        lambda e: admin_confirm(
+                            "Clear this bio?",
+                            "The member's bio text will be removed.",
+                            "CLEAR BIO",
+                            lambda: admin_run(
+                                lambda: admin_clear_bio(user_id),
+                                "Bio cleared.",
+                                refresh,
+                            ),
+                            refresh,
+                        ),
+                    )
+                )
+
+            actions.append(
+                outline_wide(
+                    "MAKE ADMIN",
+                    lambda e: admin_confirm(
+                        f"Make {name} an admin?",
+                        "They will be able to manage all members. "
+                        "Only do this for people you trust.",
+                        "MAKE ADMIN",
+                        lambda: admin_run(
+                            lambda: admin_set_admin(user_id, True),
+                            "Admin role granted.",
+                            refresh,
+                        ),
+                        refresh,
+                    ),
+                )
+            )
+
+            actions.append(
+                outline_wide(
+                    "DELETE ACCOUNT",
+                    lambda e: admin_confirm(
                         f"Delete {name}?",
                         "This permanently deletes the account, photos, "
                         "likes, matches and messages. It cannot be undone.",
                         "DELETE FOREVER",
-                        delete_it,
+                        lambda: admin_run(
+                            lambda: admin_delete_user(user_id),
+                            "User deleted.",
+                            admin_users,
+                        ),
                         refresh,
                     ),
+                    icon=ft.Icons.DELETE_FOREVER,
                 )
             )
 
@@ -3482,7 +3757,7 @@ def main(page: ft.Page):
                                 ),
                                 ft.Text(
                                     status.title()
-                                    + (" â€¢ Admin" if target_is_admin else ""),
+                                    + (" \u2022 Admin" if target_is_admin else ""),
                                     size=12,
                                     color=MUTED,
                                 ),
@@ -3490,19 +3765,145 @@ def main(page: ft.Page):
                         ),
                     ]
                 ),
-                details,
-                photo_block,
                 notice,
+                details,
+                activity,
+                photo_block,
+                match_block,
                 *actions,
             ])
         )
+
+    # ---------- photo moderation ----------
+
+    def admin_photos(page=None):
+
+        if page is not None:
+            state["aphoto_page"] = max(0, page)
+
+        page_number = state.get("aphoto_page", 0)
+        size = 12
+
+        try:
+            rows = admin_recent_photos(page_number * size, size + 1)
+            has_next = len(rows) > size
+            rows = rows[:size]
+            urls = signed_urls([r["path"] for r in rows]) if rows else {}
+        except Exception as ex:
+            admin_error("Could not load photos", ex, admin_photos)
+            return
+
+        def remove(photo):
+            admin_run(
+                lambda: admin_remove_photo(photo),
+                "Photo removed.",
+                admin_photos,
+            )
+
+        tiles = []
+
+        for photo in rows:
+
+            url = urls.get(photo["path"])
+
+            if not url:
+                continue
+
+            tiles.append(
+                ft.Column(
+                    spacing=0,
+                    width=150,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Container(
+                            width=150,
+                            height=150,
+                            border_radius=12,
+                            bgcolor=LIGHT_PINK,
+                            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                            on_click=lambda e, u=url: show_photo_viewer([u], 0),
+                            content=ft.Image(
+                                src=url,
+                                width=150,
+                                height=150,
+                                fit=FIT_COVER,
+                            ),
+                        ),
+                        ft.Text(
+                            photo.get("owner_name") or "Member",
+                            size=12,
+                            color=DARK,
+                            max_lines=1,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                        ),
+                        ft.Row(
+                            spacing=0,
+                            alignment=ft.MainAxisAlignment.CENTER,
+                            controls=[
+                                ft.TextButton(
+                                    content="Profile",
+                                    on_click=lambda e, uid=photo["user_id"]: admin_user_detail(
+                                        uid,
+                                        admin_photos,
+                                    ),
+                                ),
+                                ft.TextButton(
+                                    content="Remove",
+                                    on_click=lambda e, p=photo: admin_confirm(
+                                        "Remove this photo?",
+                                        "The photo is deleted for everyone.",
+                                        "REMOVE PHOTO",
+                                        lambda: remove(p),
+                                        admin_photos,
+                                    ),
+                                ),
+                            ],
+                        ),
+                    ],
+                )
+            )
+
+        controls = [
+            admin_header("Photos", "Newest uploads first. Review and remove."),
+            make_notice(),
+        ]
+
+        if tiles:
+            controls.append(
+                ft.Row(
+                    wrap=True,
+                    spacing=10,
+                    run_spacing=10,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    controls=tiles,
+                )
+            )
+        else:
+            controls.append(
+                empty_view(
+                    ft.Icons.PHOTO_LIBRARY_OUTLINED,
+                    "No photos yet",
+                    "Uploaded profile photos will appear here.",
+                )
+            )
+
+        if page_number > 0 or has_next:
+            controls.append(
+                pager(
+                    page_number,
+                    has_next,
+                    lambda n: admin_photos(page=n),
+                )
+            )
+
+        admin_screen(make_scrollable(controls))
 
     # ---------- reports ----------
 
     def admin_view_chat(first_id, second_id, names):
 
         try:
-            messages = get_conversation(first_id, second_id)
+            messages = admin_get_conversation(first_id, second_id)
         except Exception as ex:
             admin_error("Could not load conversation", ex, admin_reports)
             return
@@ -3524,7 +3925,7 @@ def main(page: ft.Page):
                 ]
             ),
             ft.Text(
-                "Only open this to review a report. Private messages "
+                "Shown only because of a report. Private messages "
                 "are confidential.",
                 size=12,
                 color=MUTED,
@@ -3539,14 +3940,14 @@ def main(page: ft.Page):
         for msg in messages:
 
             sender = names.get(str(msg.get("sender_id")), "Member")
+            stamp = str(msg.get("created_at") or "")[:16].replace("T", " ")
 
             controls.append(
                 ft.Column(
                     spacing=2,
                     controls=[
                         ft.Text(
-                            f"{sender} â€¢ "
-                            f"{str(msg.get('created_at') or '')[:16].replace('T', ' ')}",
+                            f"{sender} \u2022 {stamp}",
                             size=11,
                             color=MUTED,
                         ),
@@ -3567,13 +3968,24 @@ def main(page: ft.Page):
 
         admin_screen(make_scrollable(controls))
 
-    def admin_reports():
+    def admin_reports(which=None):
+
+        if which is not None:
+            state["areport"] = which
+
+        mode = state.get("areport", "open")
 
         try:
-            reports, names = admin_open_reports()
+            reports = admin_list_reports(mode)
         except Exception as ex:
             admin_error("Could not load reports", ex, admin_reports)
             return
+
+        names = {}
+
+        for r in reports:
+            names[str(r["reporter_id"])] = r.get("reporter_name") or "Member"
+            names[str(r["reported_id"])] = r.get("reported_name") or "Member"
 
         def dismiss(report):
             admin_run(
@@ -3596,7 +4008,14 @@ def main(page: ft.Page):
         controls = [
             admin_header(
                 "Reports",
-                f"{len(reports)} open",
+                f"{len(reports)} {'open' if mode == 'open' else 'closed'}",
+            ),
+            ft.Row(
+                spacing=8,
+                controls=[
+                    chip("Open", mode == "open", lambda e: admin_reports("open")),
+                    chip("Closed", mode != "open", lambda e: admin_reports("closed")),
+                ],
             ),
             make_notice(),
         ]
@@ -3605,8 +4024,8 @@ def main(page: ft.Page):
             controls.append(
                 empty_view(
                     ft.Icons.FLAG_OUTLINED,
-                    "No open reports",
-                    "New reports from members will appear here.",
+                    "No reports here",
+                    "New reports from members will appear in Open.",
                 )
             )
 
@@ -3614,6 +4033,48 @@ def main(page: ft.Page):
 
             target = str(report["reported_id"])
             reporter = str(report["reporter_id"])
+            is_open = report.get("status") == "open"
+
+            buttons = [
+                ft.TextButton(
+                    content="Profile",
+                    on_click=lambda e, t=target: admin_user_detail(
+                        t,
+                        admin_reports,
+                    ),
+                ),
+                ft.TextButton(
+                    content="Chat",
+                    on_click=lambda e, a=reporter, b=target: admin_view_chat(
+                        a,
+                        b,
+                        names,
+                    ),
+                ),
+            ]
+
+            if is_open:
+                buttons += [
+                    ft.TextButton(
+                        content="Dismiss",
+                        on_click=lambda e, r=report: dismiss(r),
+                    ),
+                    ft.TextButton(
+                        content="Suspend",
+                        on_click=lambda e, r=report: sanction(r, "suspended"),
+                    ),
+                    ft.TextButton(
+                        content="Ban",
+                        on_click=lambda e, r=report: admin_confirm(
+                            "Ban this member?",
+                            "They will be banned and this report "
+                            "marked resolved.",
+                            "BAN USER",
+                            lambda: sanction(r, "banned"),
+                            admin_reports,
+                        ),
+                    ),
+                ]
 
             controls.append(
                 panel(
@@ -3627,8 +4088,13 @@ def main(page: ft.Page):
                                 color=DARK,
                             ),
                             ft.Text(
-                                f"By {names.get(reporter, 'Member')} â€¢ "
-                                f"{str(report.get('created_at') or '')[:10]}",
+                                f"By {names.get(reporter, 'Member')} \u2022 "
+                                f"{str(report.get('created_at') or '')[:10]}"
+                                + (
+                                    ""
+                                    if is_open
+                                    else f" \u2022 {str(report.get('status')).title()}"
+                                ),
                                 size=12,
                                 color=MUTED,
                             ),
@@ -3640,45 +4106,7 @@ def main(page: ft.Page):
                             ft.Row(
                                 wrap=True,
                                 spacing=0,
-                                controls=[
-                                    ft.TextButton(
-                                        content="Profile",
-                                        on_click=lambda e, t=target: admin_user_detail(
-                                            t,
-                                            admin_reports,
-                                        ),
-                                    ),
-                                    ft.TextButton(
-                                        content="Chat",
-                                        on_click=lambda e, a=reporter, b=target: admin_view_chat(
-                                            a,
-                                            b,
-                                            names,
-                                        ),
-                                    ),
-                                    ft.TextButton(
-                                        content="Dismiss",
-                                        on_click=lambda e, r=report: dismiss(r),
-                                    ),
-                                    ft.TextButton(
-                                        content="Suspend",
-                                        on_click=lambda e, r=report: sanction(
-                                            r,
-                                            "suspended",
-                                        ),
-                                    ),
-                                    ft.TextButton(
-                                        content="Ban",
-                                        on_click=lambda e, r=report: admin_confirm(
-                                            "Ban this member?",
-                                            "They will be banned and this "
-                                            "report marked resolved.",
-                                            "BAN USER",
-                                            lambda: sanction(r, "banned"),
-                                            admin_reports,
-                                        ),
-                                    ),
-                                ],
+                                controls=buttons,
                             ),
                         ],
                     )
