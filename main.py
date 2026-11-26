@@ -660,6 +660,11 @@ def admin_set_status(user_id, status):
         "target": str(user_id),
         "new_status": status,
     })
+    if norm(status) == "active":
+        _rpc("admin_set_visibility", {
+            "target": str(user_id),
+            "visible": True,
+        })
 
 
 def admin_set_visibility(user_id, visible):
@@ -808,7 +813,7 @@ def main(page: ft.Page):
 
     page.title = "AROVI - Meaningful Connections"
     page.theme_mode = ft.ThemeMode.LIGHT
-    page.bgcolor = BG
+    page.bgcolor = DARK
     page.padding = 0
     page.spacing = 0
 
@@ -819,9 +824,7 @@ def main(page: ft.Page):
     except AttributeError:
         page.overlay.append(file_picker)
 
-    auth_user = get_auth_user()
-    current_user_id = auth_user.id if auth_user else None
-
+    current_user_id = None
     current_tab = "Discover"
     active_notice = None
 
@@ -954,10 +957,17 @@ def main(page: ft.Page):
             spacing=8,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
             controls=[
-                ft.Icon(
-                    ft.Icons.FAVORITE,
-                    size=max(18, int(size * 0.85)),
-                    color=PRIMARY,
+                ft.Container(
+                    width=max(28, int(size * 1.1)),
+                    height=max(28, int(size * 1.1)),
+                    border_radius=max(8, int(size * 0.35)),
+                    bgcolor=PRIMARY,
+                    alignment=ft.Alignment.CENTER,
+                    content=ft.Icon(
+                        ft.Icons.FAVORITE,
+                        size=max(16, int(size * 0.62)),
+                        color=WHITE,
+                    ),
                 ),
                 ft.Text(
                     APP_NAME,
@@ -1373,7 +1383,7 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # SPLASH SCREEN (RESTORED AROVI SPLASH, NO FLET LOGO)
+    # SPLASH SCREEN (IMMEDIATE AROVI LOGO, FAST TRANSITION)
     # ========================================================
 
     def show_splash():
@@ -1391,7 +1401,7 @@ def main(page: ft.Page):
                     horizontal_alignment=(
                         ft.CrossAxisAlignment.CENTER
                     ),
-                    spacing=18,
+                    spacing=16,
                     controls=[
                         ft.Container(
                             width=105,
@@ -1423,8 +1433,9 @@ def main(page: ft.Page):
                             color="#F6E9EE",
                         ),
                         ft.ProgressRing(
-                            width=25,
-                            height=25,
+                            width=22,
+                            height=22,
+                            stroke_width=2.5,
                             color=GOLD,
                         ),
                     ],
@@ -1435,7 +1446,15 @@ def main(page: ft.Page):
         page.update()
 
         async def continue_after_splash():
-            await asyncio.sleep(1.5)
+            nonlocal current_user_id
+
+            await asyncio.sleep(0.8)
+
+            try:
+                auth_user = await asyncio.to_thread(get_auth_user)
+                current_user_id = auth_user.id if auth_user else None
+            except Exception:
+                current_user_id = None
 
             if current_user_id:
                 open_dashboard()
@@ -1760,22 +1779,26 @@ def main(page: ft.Page):
                 current_user_id = result.user.id
                 profile = get_profile(current_user_id)
 
-                if not profile or int(profile.get("age") or 0) < 18:
+                if not profile:
                     api().auth.sign_out()
                     current_user_id = None
-                    notify(
-                        "This account has no valid profile yet. "
-                        "Run the Supabase setup SQL, then sign in again."
-                    )
+                    notify("Profile record was not found for this account.")
                     return
 
                 if is_blocked(profile):
+                    account_status = norm(profile.get("status"))
                     api().auth.sign_out()
                     current_user_id = None
                     notify(
-                        "This account has been suspended or banned. "
-                        "Contact AROVI support if you think this is a mistake."
+                        f"This account is currently {account_status}. "
+                        "Contact AROVI support for assistance."
                     )
+                    return
+
+                if int(profile.get("age") or 0) < 18:
+                    api().auth.sign_out()
+                    current_user_id = None
+                    notify("Account age must be 18 or older.")
                     return
 
                 if state.get("admin_mode") or profile.get("is_admin"):
@@ -1866,16 +1889,18 @@ def main(page: ft.Page):
             )
             return
 
-        if not user or int(user.get("age") or 0) < 18:
+        if not user:
             try:
                 api().auth.sign_out()
             except Exception:
                 pass
             current_user_id = None
             show_welcome()
+            notify("Profile record was not found for this account.")
             return
 
         if is_blocked(user):
+            account_status = norm(user.get("status"))
             try:
                 api().auth.sign_out()
             except Exception:
@@ -1884,9 +1909,19 @@ def main(page: ft.Page):
             state.update(queue=None, index=0, user=None)
             show_welcome()
             notify(
-                "This account has been suspended or banned. "
-                "Contact AROVI support if you think this is a mistake."
+                f"This account is currently {account_status}. "
+                "Contact AROVI support for assistance."
             )
+            return
+
+        if int(user.get("age") or 0) < 18:
+            try:
+                api().auth.sign_out()
+            except Exception:
+                pass
+            current_user_id = None
+            show_welcome()
+            notify("Account age must be 18 or older.")
             return
 
         if current_tab == "Discover":
@@ -4327,7 +4362,7 @@ def main(page: ft.Page):
                         "REACTIVATE ACCOUNT",
                         lambda e: admin_run(
                             lambda: admin_set_status(user_id, "active"),
-                            "Account reactivated.",
+                            "Account reactivated and visible.",
                             refresh,
                         ),
                         bgcolor=GREEN,
