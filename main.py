@@ -9,21 +9,11 @@ import flet as ft
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-try:
-    from supabase import ClientOptions
-except ImportError:  # older supabase-py layouts
-    from supabase.client import ClientOptions
-
 
 # ============================================================
 # AROVI - ADULT MATCHMAKING MOBILE APPLICATION
 # Flet 1.1.2 + Supabase Authentication + PostgreSQL
 # Complete single-file application (with built-in admin side)
-#
-# Runs on the NestPlore Supabase project. All AROVI tables and
-# functions live in the separate `arovi` schema, so nothing
-# collides with NestPlore's `public` schema. Auth users are
-# shared with NestPlore (same auth.users table).
 # ============================================================
 
 APP_NAME = "AROVI"
@@ -45,7 +35,6 @@ LIGHT_PINK = "#F3E2E9"
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-# Use the NestPlore project's URL and publishable (anon) key.
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 
 SUPABASE_KEY = (
@@ -53,15 +42,6 @@ SUPABASE_KEY = (
     or os.getenv("SUPABASE_KEY")
     or ""
 ).strip()
-
-# Postgres schema that holds every AROVI table and function.
-AROVI_SCHEMA = os.getenv("AROVI_SCHEMA", "arovi").strip() or "arovi"
-
-# Storage bucket for profile photos (kept separate from NestPlore's).
-PHOTO_BUCKET = (
-    os.getenv("AROVI_PHOTO_BUCKET", "arovi-photos").strip()
-    or "arovi-photos"
-)
 
 # Testing helper: set AROVI_SHOW_ALL=1 in .env to skip the
 # gender-preference filter in Discover. Remove it for real use.
@@ -72,12 +52,9 @@ supabase_error = None
 
 if SUPABASE_URL and SUPABASE_KEY:
     try:
-        # schema=AROVI_SCHEMA makes every .table() and .rpc() call
-        # go to the arovi schema. Auth and Storage are not affected.
         supabase = create_client(
             SUPABASE_URL,
-            SUPABASE_KEY,
-            options=ClientOptions(schema=AROVI_SCHEMA),
+            SUPABASE_KEY
         )
     except Exception as exc:
         supabase_error = f"Supabase initialization failed: {exc}"
@@ -158,7 +135,10 @@ def accepts(preference, other_gender):
 
 
 def preferences_match(first, second):
-    # Each side is compared with the OTHER person's gender.
+    # BUG FIX: the old version compared each person's preference with
+    # their OWN gender, so a Man interested in Women never matched a
+    # Woman interested in Men. Each side is now compared with the
+    # OTHER person's gender.
     return (
         accepts(first.get("interested_in"), second.get("gender"))
         and accepts(second.get("interested_in"), first.get("gender"))
@@ -286,7 +266,7 @@ def is_matched(user_one, user_two):
 
 
 def create_like(sender_id, receiver_id):
-    """Returns True if this like created a match. The match row is created by the database trigger in the arovi schema setup SQL (clients are not allowed to insert matches directly, so matches can't be faked)."""
+    """Returns True if this like created a match. The match row is created by the database trigger from arovi_supabase_setup.sql (clients are not allowed to insert matches directly, so matches can't be faked)."""
     sender_id = str(sender_id)
     receiver_id = str(receiver_id)
 
@@ -387,9 +367,9 @@ def submit_report(reporter_id, reported_id, reason):
 
 # ============================================================
 # PROFILE PHOTOS (private Supabase Storage bucket + signed URLs)
-# Bucket name comes from AROVI_PHOTO_BUCKET (default arovi-photos)
 # ============================================================
 
+PHOTO_BUCKET = "profile-photos"
 MAX_PHOTOS = 6
 MAX_PHOTO_BYTES = 5 * 1024 * 1024
 SIGNED_URL_SECONDS = 3600
@@ -477,9 +457,8 @@ def get_photos(user_id):
 
     if not urls:
         raise RuntimeError(
-            "Could not create photo links. Check that the "
-            f"'{PHOTO_BUCKET}' storage bucket and its policies exist "
-            "in Supabase, then try again."
+            "Could not create photo links. Run arovi_photos.sql in "
+            "Supabase and try again."
         )
 
     for row in rows:
@@ -561,9 +540,8 @@ def delete_photo(user_id, photo):
 
 # ============================================================
 # ADMIN DATABASE FUNCTIONS
-# Every call goes through an admin_* SQL function (in the arovi
-# schema) that checks is_admin() on the server, so the app UI is
-# not what protects data.
+# Every call goes through an admin_* SQL function that checks
+# is_admin() on the server, so the app UI is not what protects data.
 # ============================================================
 
 def check_admin(user_id):
@@ -715,10 +693,7 @@ def main(page: ft.Page):
     except AttributeError:
         page.overlay.append(file_picker)
 
-    # On a web deployment the Supabase client is shared by every
-    # visitor, so never auto-sign-in from it: each visitor logs in.
-    is_web = bool(getattr(page, "web", False))
-    auth_user = None if is_web else get_auth_user()
+    auth_user = get_auth_user()
     current_user_id = auth_user.id if auth_user else None
 
     current_tab = "Discover"
@@ -1482,7 +1457,6 @@ def main(page: ft.Page):
                             "gender": gender.value,
                             "interested_in": interested.value,
                             "location": place,
-                            "arovi_app": True,
                         }
                     },
                 })
@@ -1618,9 +1592,8 @@ def main(page: ft.Page):
                     current_user_id = None
 
                     notify(
-                        "No AROVI profile found for this account. "
-                        "Create an AROVI account first, or check that "
-                        "the arovi schema setup SQL has been run."
+                        "This account has no valid profile yet. "
+                        "Run the Supabase setup SQL, then sign in again."
                     )
                     return
 
@@ -4163,10 +4136,9 @@ def main(page: ft.Page):
                         text_align=ft.TextAlign.CENTER,
                     ),
                     ft.Text(
-                        "Set SUPABASE_URL and SUPABASE_KEY (the NestPlore "
-                        "project's URL and publishable key) in a .env file "
-                        "beside main.py, or in Render's environment "
-                        "variables. Then restart AROVI.",
+                        "Create a .env file beside main.py and add "
+                        "SUPABASE_URL and SUPABASE_KEY. "
+                        "Then restart AROVI.",
                         color=MUTED,
                         text_align=ft.TextAlign.CENTER,
                     ),
