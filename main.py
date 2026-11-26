@@ -781,7 +781,6 @@ def admin_list_announcements():
 
 
 def admin_publish_announcement(title, body):
-    # Deactivate existing active announcements so only the latest is live
     api().table("announcements").update({"is_active": False}).eq("is_active", True).execute()
     if title.strip() and body.strip():
         api().table("announcements").insert({
@@ -950,11 +949,23 @@ def main(page: ft.Page):
         )
 
     def app_logo(size=30):
-        return ft.Text(
-            APP_NAME,
-            size=size,
-            weight=ft.FontWeight.BOLD,
-            color=PRIMARY,
+        return ft.Row(
+            main_size=ft.MainAxisSize.MIN,
+            spacing=8,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Icon(
+                    ft.Icons.FAVORITE,
+                    size=max(18, int(size * 0.85)),
+                    color=PRIMARY,
+                ),
+                ft.Text(
+                    APP_NAME,
+                    size=size,
+                    weight=ft.FontWeight.BOLD,
+                    color=PRIMARY,
+                ),
+            ],
         )
 
     def centered_icon(icon, size=48):
@@ -1039,7 +1050,11 @@ def main(page: ft.Page):
                                 ft.IconButton(
                                     icon=ft.Icons.CLOSE,
                                     icon_color=WHITE,
-                                    on_click=lambda e: open_dashboard(),
+                                    on_click=lambda e: (
+                                        open_admin()
+                                        if state.get("admin")
+                                        else open_dashboard()
+                                    ),
                                 ),
                             ],
                         ),
@@ -1358,7 +1373,7 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # SPLASH SCREEN
+    # SPLASH SCREEN (RESTORED AROVI SPLASH, NO FLET LOGO)
     # ========================================================
 
     def show_splash():
@@ -1687,6 +1702,7 @@ def main(page: ft.Page):
         notice = make_notice()
 
         state["admin_mode"] = False
+        state["admin"] = False
         taps = {"count": 0}
 
         admin_tag = ft.Container(
@@ -1762,7 +1778,7 @@ def main(page: ft.Page):
                     )
                     return
 
-                if state.get("admin_mode"):
+                if state.get("admin_mode") or profile.get("is_admin"):
                     if not profile.get("is_admin"):
                         api().auth.sign_out()
                         current_user_id = None
@@ -1775,6 +1791,7 @@ def main(page: ft.Page):
                     open_admin()
                     return
 
+                state["admin"] = False
                 current_tab = "Discover"
                 open_dashboard()
 
@@ -3587,6 +3604,7 @@ def main(page: ft.Page):
             show_welcome()
             return
 
+        state["admin"] = True
         tab = state.get("atab", "Dashboard")
 
         if tab == "Users":
@@ -3876,7 +3894,6 @@ def main(page: ft.Page):
         admin_screen(make_scrollable(controls))
 
     def admin_edit_full_profile_screen(person, back):
-        """Comprehensive Admin Profile Editor for all user attributes."""
         notice = make_notice()
         uid = person["id"]
 
@@ -4791,7 +4808,6 @@ def main(page: ft.Page):
                 )
             )
 
-        # Recent Photo Audit Section
         controls.append(
             ft.Text(
                 "Recent Photo Uploads Audit",
