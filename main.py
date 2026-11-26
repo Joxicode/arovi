@@ -1482,6 +1482,7 @@ def main(page: ft.Page):
                             "gender": gender.value,
                             "interested_in": interested.value,
                             "location": place,
+                            "arovi_app": True,
                         }
                     },
                 })
