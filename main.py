@@ -49,6 +49,7 @@ PHOTO_BUCKET = (os.getenv("AROVI_BUCKET", "arovi-photos") or "arovi-photos").str
 SUPPORT_EMAIL = (
     os.getenv("AROVI_SUPPORT_EMAIL", "support@arovi.app") or "support@arovi.app"
 ).strip()
+AROVI_LOGO_URL = os.getenv("AROVI_LOGO_URL", "").strip()
 
 config_error = None
 
@@ -265,7 +266,6 @@ class AroviData:
                 "path": file_path,
             }).execute()
         except Exception:
-            # don't leave an orphan file behind
             try:
                 storage.remove([file_path])
             except Exception:
@@ -621,8 +621,6 @@ def main(page: ft.Page):
     current_tab = "Discover"
     active_notice = None
 
-    # queue/index = Discover cards; chat_token stops chat polling;
-    # admin_mode = hidden admin login unlocked; admin = verified admin session
     state = {
         "queue": None,
         "index": 0,
@@ -683,8 +681,6 @@ def main(page: ft.Page):
         )
 
     def primary_button(label, action):
-        # Row-wrapped: expand=True then means full WIDTH (a bare expanded
-        # button inside a Column stretches to full height)
         return ft.Row(
             controls=[
                 ft.Button(
@@ -705,7 +701,6 @@ def main(page: ft.Page):
         )
 
     def wide_button(label, action):
-        # full-width button that is safe inside scrolling columns
         return ft.Row(
             controls=[
                 ft.Button(
@@ -759,6 +754,39 @@ def main(page: ft.Page):
             color=PRIMARY,
         )
 
+    def arovi_brand_mark(size=105):
+        fallback = ft.Container(
+            width=size,
+            height=size,
+            border_radius=size * 0.28,
+            bgcolor=PRIMARY,
+            alignment=ft.Alignment.CENTER,
+            content=ft.Icon(
+                ft.Icons.FAVORITE,
+                color=WHITE,
+                size=size * 0.52,
+            ),
+        )
+
+        if not AROVI_LOGO_URL:
+            return fallback
+
+        return ft.Container(
+            width=size,
+            height=size,
+            border_radius=size * 0.28,
+            bgcolor=WHITE,
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            alignment=ft.Alignment.CENTER,
+            content=ft.Image(
+                src=AROVI_LOGO_URL,
+                width=size,
+                height=size,
+                fit=FIT_CONTAIN,
+                error_content=fallback,
+            ),
+        )
+
     def centered_icon(icon, size=48):
         return ft.Container(
             width=90,
@@ -806,6 +834,9 @@ def main(page: ft.Page):
 
     def show_photo_viewer(urls, index=0):
         """Full-screen photo viewer with previous / next."""
+        if not urls:
+            open_dashboard()
+            return
 
         index = max(0, min(index, len(urls) - 1))
 
@@ -1061,10 +1092,15 @@ def main(page: ft.Page):
             )
         ]
 
-        if nav is not None:
-            items.append(nav)
-        elif navigation and current_user_id:
-            items.append(build_bottom_navigation())
+        # Admin sessions never receive member navigation tabs
+        if state.get("admin"):
+            if nav is not None:
+                items.append(nav)
+        else:
+            if nav is not None:
+                items.append(nav)
+            elif navigation and current_user_id:
+                items.append(build_bottom_navigation())
 
         page.add(
             ft.Column(
@@ -1292,7 +1328,7 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # SPLASH SCREEN
+    # AROVI STARTUP SCREEN
     # ========================================================
 
     def show_splash():
@@ -1313,18 +1349,7 @@ def main(page: ft.Page):
                     ),
                     spacing=18,
                     controls=[
-                        ft.Container(
-                            width=105,
-                            height=105,
-                            border_radius=30,
-                            bgcolor=PRIMARY,
-                            alignment=ft.Alignment.CENTER,
-                            content=ft.Icon(
-                                ft.Icons.FAVORITE,
-                                color=WHITE,
-                                size=55,
-                            ),
-                        ),
+                        arovi_brand_mark(110),
                         ft.Text(
                             "AROVI",
                             size=42,
@@ -1357,9 +1382,12 @@ def main(page: ft.Page):
         async def continue_after_splash():
             await asyncio.sleep(1.5)
 
-            if current_user_id:
-                open_dashboard()
-            else:
+            try:
+                if current_user_id:
+                    open_dashboard()
+                else:
+                    show_welcome()
+            except Exception:
                 show_welcome()
 
         page.run_task(continue_after_splash)
@@ -1378,7 +1406,7 @@ def main(page: ft.Page):
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             spacing=17,
             controls=[
-                centered_icon(ft.Icons.FAVORITE, 52),
+                arovi_brand_mark(96),
                 app_logo(38),
                 ft.Text(
                     "A better way to find your person.",
@@ -1434,7 +1462,7 @@ def main(page: ft.Page):
         show_screen(content)
 
     # ========================================================
-    # REGISTRATION (after sign-up the member goes to the LOGIN screen)
+    # REGISTRATION
     # ========================================================
 
     def show_register(e=None):
@@ -1564,7 +1592,6 @@ def main(page: ft.Page):
 
             had_session = bool(getattr(result, "session", None))
 
-            # never keep the new member signed in - they go to the login page
             try:
                 d.client.auth.sign_out()
             except Exception:
@@ -1621,6 +1648,7 @@ def main(page: ft.Page):
         notice = make_notice()
 
         state["admin_mode"] = False
+        state["admin"] = False
         taps = {"count": 0}
 
         admin_tag = ft.Text(
@@ -1682,10 +1710,10 @@ def main(page: ft.Page):
                         d.client.auth.sign_out()
                         current_user_id = None
                         state["admin_mode"] = False
+                        state["admin"] = False
                         notify("This account is not authorized.")
                         return
 
-                    # signed in, but has no AROVI profile yet
                     show_complete_profile()
                     return
 
@@ -1693,6 +1721,7 @@ def main(page: ft.Page):
 
                     d.client.auth.sign_out()
                     current_user_id = None
+                    state["admin"] = False
 
                     notify(
                         "This account has been suspended or banned. "
@@ -1708,6 +1737,7 @@ def main(page: ft.Page):
                         d.client.auth.sign_out()
                         current_user_id = None
                         state["admin_mode"] = False
+                        state["admin"] = False
 
                         notify("This account is not authorized.")
                         return
@@ -1717,6 +1747,7 @@ def main(page: ft.Page):
                     open_admin()
                     return
 
+                state["admin"] = False
                 current_tab = "Discover"
                 open_dashboard()
 
@@ -1765,9 +1796,7 @@ def main(page: ft.Page):
         show_screen(content)
 
     # ========================================================
-    # FORGOT PASSWORD (6-digit code sent by email)
-    # In Supabase > Authentication > Email Templates > "Reset Password",
-    # add the line: Your code: {{ .Token }}
+    # FORGOT PASSWORD
     # ========================================================
 
     def show_forgot_password(e=None):
@@ -1888,8 +1917,7 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # FINISH PROFILE (signed in but no AROVI profile, e.g. an
-    # account created in another app on the same Supabase project)
+    # FINISH PROFILE
     # ========================================================
 
     def show_complete_profile():
@@ -1966,26 +1994,24 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # DASHBOARD ROUTER
+    # DASHBOARD ROUTER (SEPARATE ADMIN & USER WORKSPACES)
     # ========================================================
 
     def open_dashboard():
 
         nonlocal current_user_id
 
-        # stops any running chat poller
         state["chat_token"] += 1
 
         if not current_user_id:
             show_welcome()
             return
 
-        # verified admin sessions use the admin dashboard
+        # Admin sessions belong strictly in the Admin Dashboard
         if state.get("admin"):
             open_admin()
             return
 
-        # a different user signed in -> start with fresh data
         if state["user"] != current_user_id:
             state.update(
                 queue=None,
@@ -2232,7 +2258,6 @@ def main(page: ft.Page):
 
         top = [header] + ([banner] if banner else [])
 
-        # Explain WHY Discover is empty instead of a blank screen
         if not user.get("gender") or not user.get("interested_in"):
 
             show_screen(
@@ -2322,7 +2347,6 @@ def main(page: ft.Page):
             show_discover()
 
         def after_report():
-            # move past the reported profile
             state["index"] += 1
             show_discover()
 
@@ -2433,12 +2457,10 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # MATCHES (matched members are locked in: they leave Discover
-    # and can only be reached through Matches / Messages)
+    # MATCHES
     # ========================================================
 
     def show_like_profile(person):
-        """A member who liked you: like back (match) or pass."""
 
         pid = person["id"]
         name = display_name(person)
@@ -2958,7 +2980,6 @@ def main(page: ft.Page):
 
         page.update()
 
-        # light polling so new messages appear without reopening the chat
         async def poll():
 
             while state["chat_token"] == token:
@@ -2988,7 +3009,7 @@ def main(page: ft.Page):
         page.run_task(poll)
 
     # ========================================================
-    # MEMBER PROFILE (a match): message, unmatch, block, report
+    # MEMBER PROFILE
     # ========================================================
 
     def show_member_profile(person, back):
@@ -3282,7 +3303,6 @@ def main(page: ft.Page):
                     "is_active": bool(visible.value),
                 })
 
-                # preferences may have changed -> rebuild Discover
                 state["queue"] = None
 
                 notify(
@@ -3329,7 +3349,6 @@ def main(page: ft.Page):
 
             try:
                 try:
-                    # ask the phone to send the image bytes (no file path on Android)
                     picked = await file_picker.pick_files(
                         with_data=True,
                         **picker_args,
@@ -3590,8 +3609,7 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # SAFETY, TERMS AND PRIVACY (plain information pages)
-    # Have a lawyer review the Terms and Privacy text before launch.
+    # SAFETY, TERMS AND PRIVACY
     # ========================================================
 
     def show_text_page(title, intro, sections, back):
@@ -3768,7 +3786,7 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # CHANGE PASSWORD (members and admins)
+    # CHANGE PASSWORD
     # ========================================================
 
     def show_change_password(back):
@@ -3800,7 +3818,6 @@ def main(page: ft.Page):
                 notify("Choose a password different from the current one.")
                 return
 
-            # confirm the current password first
             try:
                 profile = d.get_profile(current_user_id) or {}
                 mail = profile.get("email") or d.auth_email()
@@ -3844,8 +3861,6 @@ def main(page: ft.Page):
 
     # ========================================================
     # ADMIN DASHBOARD
-    # Reached only through the hidden admin sign-in, and only when
-    # the database says is_admin = true for the signed-in account.
     # ========================================================
 
     ADMIN_PAGE = 20
@@ -3916,7 +3931,6 @@ def main(page: ft.Page):
         )
 
     def admin_run(action, ok_message, after):
-        """Run an admin action, rebuild the screen, then show the result."""
         try:
             action()
         except Exception as ex:
