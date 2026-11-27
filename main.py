@@ -139,17 +139,9 @@ FIT_CONTAIN = _BOX_FIT.CONTAIN
 
 class AroviData:
 
-    def __init__(self, client=None):
-        self._client = client
+    def __init__(self, client):
+        self.client = client
         self._urls = {}
-
-    @property
-    def client(self):
-        if self._client is None:
-            if not (SUPABASE_URL and SUPABASE_KEY):
-                raise RuntimeError("Supabase URL or publishable key is missing.")
-            self._client = make_client()
-        return self._client
 
     # ---------- plumbing ----------
 
@@ -172,16 +164,9 @@ class AroviData:
         except Exception:
             return ""
 
-    def get_auth_user(self):
-        try:
-            result = self.client.auth.get_user()
-            return getattr(result, "user", None)
-        except Exception:
-            return None
-
-    @staticmethod
+@staticmethod
     def with_age(row):
-        if row and "birth_date" in row:
+        if "birth_date" in row:
             row["age"] = calc_age(row.get("birth_date"))
         return row
 
@@ -282,6 +267,7 @@ class AroviData:
                 "path": file_path,
             }).execute()
         except Exception:
+            # don't leave an orphan file behind
             try:
                 storage.remove([file_path])
             except Exception:
@@ -408,6 +394,11 @@ class AroviData:
 
     def get_matches(self):
         rows = self.rpc("my_matches") or []
+        self.attach_avatars(rows)
+        return rows
+
+    def get_likes_received(self):
+        rows = self.rpc("likes_received") or []
         self.attach_avatars(rows)
         return rows
 
@@ -606,12 +597,18 @@ def main(page: ft.Page):
 
     page.title = "AROVI - Meaningful Connections"
     page.theme_mode = ft.ThemeMode.LIGHT
-    page.bgcolor = DARK
+    page.bgcolor = BG
     page.padding = 0
     page.spacing = 0
 
     boot_error = config_error
-    d = AroviData() if not boot_error else None
+    d = None
+
+    if not boot_error:
+        try:
+            d = AroviData(make_client())
+        except Exception as exc:
+            boot_error = f"Supabase initialization failed: {exc}"
 
     # photo picker (Flet 1.x uses page.services; older versions used overlay)
     file_picker = ft.FilePicker()
@@ -688,6 +685,8 @@ def main(page: ft.Page):
         )
 
     def primary_button(label, action):
+        # Row-wrapped: expand=True then means full WIDTH (a bare expanded
+        # button inside a Column stretches to full height)
         return ft.Row(
             controls=[
                 ft.Button(
@@ -708,6 +707,7 @@ def main(page: ft.Page):
         )
 
     def wide_button(label, action):
+        # full-width button that is safe inside scrolling columns
         return ft.Row(
             controls=[
                 ft.Button(
@@ -1313,23 +1313,23 @@ def main(page: ft.Page):
                     horizontal_alignment=(
                         ft.CrossAxisAlignment.CENTER
                     ),
-                    spacing=14,
+                    spacing=18,
                     controls=[
                         ft.Container(
-                            width=100,
-                            height=100,
-                            border_radius=28,
+                            width=105,
+                            height=105,
+                            border_radius=30,
                             bgcolor=PRIMARY,
                             alignment=ft.Alignment.CENTER,
                             content=ft.Icon(
                                 ft.Icons.FAVORITE,
                                 color=WHITE,
-                                size=52,
+                                size=55,
                             ),
                         ),
                         ft.Text(
                             "AROVI",
-                            size=40,
+                            size=42,
                             weight=ft.FontWeight.BOLD,
                             color=WHITE,
                         ),
@@ -1341,13 +1341,12 @@ def main(page: ft.Page):
                         ),
                         ft.Text(
                             "Meet someone who matters.",
-                            size=14,
+                            size=15,
                             color="#F6E9EE",
                         ),
                         ft.ProgressRing(
-                            width=20,
-                            height=20,
-                            stroke_width=2.5,
+                            width=25,
+                            height=25,
                             color=GOLD,
                         ),
                     ],
@@ -1358,15 +1357,7 @@ def main(page: ft.Page):
         page.update()
 
         async def continue_after_splash():
-            nonlocal current_user_id
-
-            await asyncio.sleep(0.4)
-
-            try:
-                auth_user = await asyncio.to_thread(d.get_auth_user)
-                current_user_id = getattr(auth_user, "id", None) if auth_user else None
-            except Exception:
-                current_user_id = None
+            await asyncio.sleep(1.5)
 
             if current_user_id:
                 open_dashboard()
@@ -1575,6 +1566,7 @@ def main(page: ft.Page):
 
             had_session = bool(getattr(result, "session", None))
 
+            # never keep the new member signed in - they go to the login page
             try:
                 d.client.auth.sign_out()
             except Exception:
@@ -1695,6 +1687,7 @@ def main(page: ft.Page):
                         notify("This account is not authorized.")
                         return
 
+                    # signed in, but has no AROVI profile yet
                     show_complete_profile()
                     return
 
@@ -1775,6 +1768,8 @@ def main(page: ft.Page):
 
     # ========================================================
     # FORGOT PASSWORD (6-digit code sent by email)
+    # In Supabase > Authentication > Email Templates > "Reset Password",
+    # add the line: Your code: {{ .Token }}
     # ========================================================
 
     def show_forgot_password(e=None):
@@ -1895,7 +1890,8 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # FINISH PROFILE
+    # FINISH PROFILE (signed in but no AROVI profile, e.g. an
+    # account created in another app on the same Supabase project)
     # ========================================================
 
     def show_complete_profile():
@@ -1979,16 +1975,19 @@ def main(page: ft.Page):
 
         nonlocal current_user_id
 
+        # stops any running chat poller
         state["chat_token"] += 1
 
         if not current_user_id:
             show_welcome()
             return
 
+        # verified admin sessions use the admin dashboard
         if state.get("admin"):
             open_admin()
             return
 
+        # a different user signed in -> start with fresh data
         if state["user"] != current_user_id:
             state.update(
                 queue=None,
@@ -2235,6 +2234,7 @@ def main(page: ft.Page):
 
         top = [header] + ([banner] if banner else [])
 
+        # Explain WHY Discover is empty instead of a blank screen
         if not user.get("gender") or not user.get("interested_in"):
 
             show_screen(
@@ -2324,6 +2324,7 @@ def main(page: ft.Page):
             show_discover()
 
         def after_report():
+            # move past the reported profile
             state["index"] += 1
             show_discover()
 
@@ -2434,8 +2435,114 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # MATCHES
+    # MATCHES (matched members are locked in: they leave Discover
+    # and can only be reached through Matches / Messages)
     # ========================================================
+
+    def show_like_profile(person):
+        """A member who liked you: like back (match) or pass."""
+
+        pid = person["id"]
+        name = display_name(person)
+
+        try:
+            photos = d.get_photos(pid)
+        except Exception:
+            photos = []
+
+        notice = make_notice()
+
+        def here():
+            show_like_profile(person)
+
+        def like_back(e):
+            try:
+                mutual = d.like_person(pid)
+            except Exception as ex:
+                notify(friendly(ex))
+                return
+
+            state["queue"] = None
+            state["matches"] = None
+
+            if mutual:
+                show_match_screen(person)
+            else:
+                show_matches()
+
+        def decline(e):
+            try:
+                d.pass_person(pid)
+            except Exception as ex:
+                notify(friendly(ex))
+                return
+
+            state["queue"] = None
+            show_matches()
+            notify(f"You passed on {name}.", MUTED)
+
+        bio_text = (person.get("bio") or "").strip()
+
+        show_screen(
+            make_scrollable([
+                ft.Row(
+                    controls=[
+                        ft.IconButton(
+                            icon=ft.Icons.ARROW_BACK,
+                            icon_color=PRIMARY,
+                            on_click=lambda e: show_matches(),
+                        ),
+                        ft.Text(
+                            f"{name} liked you",
+                            size=18,
+                            weight=ft.FontWeight.BOLD,
+                            color=DARK,
+                        ),
+                    ]
+                ),
+                panel(
+                    ft.Column(
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=12,
+                        controls=[
+                            gallery_view(photos, person),
+                            ft.Text(
+                                f"{name}, {person.get('age', '')}",
+                                size=24,
+                                weight=ft.FontWeight.BOLD,
+                                color=DARK,
+                                text_align=ft.TextAlign.CENTER,
+                            ),
+                            ft.Text(
+                                person.get("location") or "",
+                                size=13,
+                                color=MUTED,
+                            ),
+                            ft.Text(
+                                bio_text or "No bio yet.",
+                                size=14,
+                                color=DARK if bio_text else MUTED,
+                                text_align=ft.TextAlign.CENTER,
+                            ),
+                        ],
+                    ),
+                    padding=24,
+                ),
+                notice,
+                wide_button("LIKE BACK", like_back),
+                outline_wide(
+                    "PASS",
+                    decline,
+                    icon=ft.Icons.CLOSE,
+                ),
+                outline_wide(
+                    "REPORT",
+                    lambda e: show_report(pid, name, here),
+                    icon=ft.Icons.FLAG_OUTLINED,
+                ),
+            ]),
+            navigation=True,
+        )
 
     def load_matches():
         matches = d.get_matches()
@@ -2446,6 +2553,11 @@ def main(page: ft.Page):
 
         try:
             matches = load_matches()
+
+            try:
+                likes = d.get_likes_received()
+            except Exception:
+                likes = []
         except Exception as ex:
             show_screen(
                 error_view(
@@ -2466,12 +2578,49 @@ def main(page: ft.Page):
             app_logo(25),
             heading(
                 "Your matches",
-                f"{len(matches)} mutual connection(s)",
+                f"{len(matches)} mutual connection(s). Matched members "
+                "no longer appear in Discover.",
             ),
             notice,
         ]
 
-        if not matches:
+        if likes:
+
+            controls.append(
+                ft.Text(
+                    f"Likes you ({len(likes)})",
+                    size=16,
+                    weight=ft.FontWeight.BOLD,
+                    color=DARK,
+                )
+            )
+
+            for person in likes:
+                controls.append(
+                    person_row(
+                        person,
+                        person_subtitle(person),
+                        lambda e, p=person: show_like_profile(p),
+                        trailing=ft.Text(
+                            "Like back?",
+                            size=11,
+                            weight=ft.FontWeight.BOLD,
+                            color=PRIMARY,
+                        ),
+                    )
+                )
+
+            if matches:
+                controls.append(
+                    ft.Text(
+                        "Matches",
+                        size=16,
+                        weight=ft.FontWeight.BOLD,
+                        color=DARK,
+                    )
+                )
+
+        if not matches and not likes:
 
             controls.append(
                 empty_view(
@@ -2811,6 +2960,7 @@ def main(page: ft.Page):
 
         page.update()
 
+        # light polling so new messages appear without reopening the chat
         async def poll():
 
             while state["chat_token"] == token:
@@ -2840,7 +2990,7 @@ def main(page: ft.Page):
         page.run_task(poll)
 
     # ========================================================
-    # MEMBER PROFILE
+    # MEMBER PROFILE (a match): message, unmatch, block, report
     # ========================================================
 
     def show_member_profile(person, back):
@@ -3134,6 +3284,7 @@ def main(page: ft.Page):
                     "is_active": bool(visible.value),
                 })
 
+                # preferences may have changed -> rebuild Discover
                 state["queue"] = None
 
                 notify(
@@ -3154,6 +3305,7 @@ def main(page: ft.Page):
             sign_out_all()
             notify("Your AROVI account has been deleted.", GREEN)
 
+        # ---------- photos ----------
         try:
             photos = d.get_photos(current_user_id)
         except Exception as ex:
@@ -3179,6 +3331,7 @@ def main(page: ft.Page):
 
             try:
                 try:
+                    # ask the phone to send the image bytes (no file path on Android)
                     picked = await file_picker.pick_files(
                         with_data=True,
                         **picker_args,
@@ -3439,7 +3592,8 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # SAFETY, TERMS AND PRIVACY
+    # SAFETY, TERMS AND PRIVACY (plain information pages)
+    # Have a lawyer review the Terms and Privacy text before launch.
     # ========================================================
 
     def show_text_page(title, intro, sections, back):
@@ -3616,7 +3770,7 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # CHANGE PASSWORD
+    # CHANGE PASSWORD (members and admins)
     # ========================================================
 
     def show_change_password(back):
@@ -3648,6 +3802,7 @@ def main(page: ft.Page):
                 notify("Choose a password different from the current one.")
                 return
 
+            # confirm the current password first
             try:
                 profile = d.get_profile(current_user_id) or {}
                 mail = profile.get("email") or d.auth_email()
@@ -3691,6 +3846,8 @@ def main(page: ft.Page):
 
     # ========================================================
     # ADMIN DASHBOARD
+    # Reached only through the hidden admin sign-in, and only when
+    # the database says is_admin = true for the signed-in account.
     # ========================================================
 
     ADMIN_PAGE = 20
@@ -3761,6 +3918,7 @@ def main(page: ft.Page):
         )
 
     def admin_run(action, ok_message, after):
+        """Run an admin action, rebuild the screen, then show the result."""
         try:
             action()
         except Exception as ex:
@@ -3898,6 +4056,8 @@ def main(page: ft.Page):
         else:
             admin_overview()
 
+    # ---------- overview ----------
+
     def admin_overview():
 
         try:
@@ -3978,6 +4138,8 @@ def main(page: ft.Page):
         controls.append(wide_button("REFRESH", lambda e: admin_overview()))
 
         admin_screen(make_scrollable(controls))
+
+    # ---------- users ----------
 
     def admin_users(search=None, filter_by=None, page=None):
 
@@ -4465,6 +4627,8 @@ def main(page: ft.Page):
             ])
         )
 
+    # ---------- photo moderation ----------
+
     def admin_photos(page=None):
 
         if page is not None:
@@ -4586,6 +4750,8 @@ def main(page: ft.Page):
             )
 
         admin_screen(make_scrollable(controls))
+
+    # ---------- reports ----------
 
     def admin_view_chat(first_id, second_id, names):
 
@@ -4801,6 +4967,8 @@ def main(page: ft.Page):
             )
 
         admin_screen(make_scrollable(controls))
+
+    # ---------- more tools: announcements, activity log ----------
 
     def admin_more():
 
