@@ -46,7 +46,7 @@ SUPABASE_KEY = (
 
 # AROVI lives in its own database schema so it can share a Supabase
 # project with other apps. Set AROVI_SCHEMA=public to use the old layout.
-SCHEMA = (os.getenv("AROVI_SCHEMA", "arovi") or "arovi").strip()
+SCHEMA = (os.getenv("AROVI_SCHEMA", "public") or "public").strip()
 PHOTO_BUCKET = (os.getenv("AROVI_BUCKET", "arovi-photos") or "arovi-photos").strip()
 SUPPORT_EMAIL = (
     os.getenv("AROVI_SUPPORT_EMAIL", "support@arovi.app") or "support@arovi.app"
