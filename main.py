@@ -49,7 +49,92 @@ PHOTO_BUCKET = (os.getenv("AROVI_BUCKET", "arovi-photos") or "arovi-photos").str
 SUPPORT_EMAIL = (
     os.getenv("AROVI_SUPPORT_EMAIL", "support@arovi.app") or "support@arovi.app"
 ).strip()
-AROVI_LOGO_URL = os.getenv("AROVI_LOGO_URL", "https://raw.githubusercontent.com/Joxicode/arovi/f11b708dcb82f5d512aa0c6a83e00dd105d5c10e/arovi_logo.png").strip()
+AROVI_LOGO_URL = os.getenv(
+    "AROVI_LOGO_URL",
+    "https://raw.githubusercontent.com/Joxicode/arovi/f11b708dcb82f5d512aa0c6a83e00dd105d5c10e/arovi_logo.png",
+).strip()
+
+SPLASH_REDIRECT_PATH = os.getenv("AROVI_APP_PATH", "/app").strip() or "/app"
+
+SPLASH_HTML = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AROVI — Meaningful Connections</title>
+  <style>
+    * {{
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }}
+    body {{
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 18px;
+      background: #321C2B;
+      color: #F6E9EE;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      text-align: center;
+      padding: 24px;
+    }}
+    .logo-card {{
+      background: #000000;
+      padding: 14px 22px;
+      border-radius: 16px;
+      max-width: 280px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+    }}
+    .logo-card img {{
+      display: block;
+      max-width: 100%;
+      height: auto;
+    }}
+    .tagline {{
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      font-weight: 700;
+      color: #D6A56C;
+    }}
+    .subtitle {{
+      font-size: 15px;
+      color: #F6E9EE;
+    }}
+    .spinner {{
+      width: 26px;
+      height: 26px;
+      border: 3px solid rgba(214, 165, 108, 0.25);
+      border-top-color: #D6A56C;
+      border-radius: 50%;
+      animation: spin 0.85s linear infinite;
+    }}
+    @keyframes spin {{
+      to {{ transform: rotate(360deg); }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="logo-card">
+    <img
+      src="{AROVI_LOGO_URL}"
+      alt="AROVI"
+    />
+  </div>
+  <div class="tagline">MEANINGFUL CONNECTIONS</div>
+  <div class="subtitle">Meet someone who matters.</div>
+  <div class="spinner" aria-label="Loading"></div>
+
+  <script>
+    setTimeout(function () {{
+      window.location.replace({SPLASH_REDIRECT_PATH!r});
+    }}, 2000);
+  </script>
+</body>
+</html>
+"""
 
 
 config_error = None
@@ -756,6 +841,9 @@ def main(page: ft.Page):
         )
 
     def arovi_brand_mark(size=105):
+        wide_w = int(size * 2.2)
+        tall_h = int(size * 0.85)
+
         fallback = ft.Container(
             width=size,
             height=size,
@@ -773,16 +861,16 @@ def main(page: ft.Page):
             return fallback
 
         return ft.Container(
-            width=size,
-            height=size,
-            border_radius=size * 0.28,
-            bgcolor=WHITE,
+            width=wide_w,
+            height=tall_h,
+            border_radius=16,
+            bgcolor="#000000",
             clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
             alignment=ft.Alignment.CENTER,
             content=ft.Image(
                 src=AROVI_LOGO_URL,
-                width=size,
-                height=size,
+                width=wide_w,
+                height=tall_h,
                 fit=FIT_CONTAIN,
                 error_content=fallback,
             ),
@@ -1329,7 +1417,7 @@ def main(page: ft.Page):
         )
 
     # ========================================================
-    # AROVI STARTUP SCREEN
+    # AROVI STARTUP SCREEN (2-SECOND DELAY)
     # ========================================================
 
     def show_splash():
@@ -1351,12 +1439,6 @@ def main(page: ft.Page):
                     spacing=18,
                     controls=[
                         arovi_brand_mark(110),
-                        ft.Text(
-                            "AROVI",
-                            size=42,
-                            weight=ft.FontWeight.BOLD,
-                            color=WHITE,
-                        ),
                         ft.Text(
                             "MEANINGFUL CONNECTIONS",
                             size=11,
@@ -1381,7 +1463,7 @@ def main(page: ft.Page):
         page.update()
 
         async def continue_after_splash():
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2)
 
             try:
                 if current_user_id:
@@ -1394,7 +1476,7 @@ def main(page: ft.Page):
         page.run_task(continue_after_splash)
 
     # ========================================================
-    # WELCOME SCREEN
+    # WELCOME SCREEN (SINGLE AROVI LOGO)
     # ========================================================
 
     def show_welcome():
@@ -1407,8 +1489,7 @@ def main(page: ft.Page):
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             spacing=17,
             controls=[
-                arovi_brand_mark(96),
-                app_logo(38),
+                arovi_brand_mark(105),
                 ft.Text(
                     "A better way to find your person.",
                     size=16,
@@ -5255,8 +5336,57 @@ def main(page: ft.Page):
 
 
 # ============================================================
+# OPTIONAL ASGI WRAPPER FOR CUSTOM HTML SPLASH AT "/"
+# ============================================================
+
+def _make_asgi_wrapper(flet_asgi_app):
+    html_bytes = SPLASH_HTML.encode("utf-8")
+
+    async def asgi_app(scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/":
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"text/html; charset=utf-8"),
+                    (b"cache-control", b"no-cache"),
+                ],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": html_bytes,
+            })
+            return
+
+        await flet_asgi_app(scope, receive, send)
+
+    return asgi_app
+
+
+def get_asgi_app():
+    flet_app_factory = getattr(ft, "app", None)
+    if callable(flet_app_factory):
+        try:
+            raw_app = flet_app_factory(main, export_asgi_app=True)
+            if raw_app is not None:
+                return _make_asgi_wrapper(raw_app)
+        except TypeError:
+            pass
+    return None
+
+
+app = get_asgi_app()
+
+
+# ============================================================
 # RUN AROVI
 # ============================================================
 
 if __name__ == "__main__":
-    ft.run(main)
+    host = "0.0.0.0"
+    port = int(os.getenv("PORT", "8000"))
+
+    try:
+        ft.run(main, host=host, port=port)
+    except TypeError:
+        ft.run(main)
