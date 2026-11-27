@@ -49,7 +49,8 @@ PHOTO_BUCKET = (os.getenv("AROVI_BUCKET", "arovi-photos") or "arovi-photos").str
 SUPPORT_EMAIL = (
     os.getenv("AROVI_SUPPORT_EMAIL", "support@arovi.app") or "support@arovi.app"
 ).strip()
-AROVI_LOGO_URL = os.getenv("AROVI_LOGO_URL", "").strip()
+AROVI_LOGO_URL = os.getenv("AROVI_LOGO_URL", "https://raw.githubusercontent.com/Joxicode/arovi/f11b708dcb82f5d512aa0c6a83e00dd105d5c10e/arovi_logo.png").strip()
+
 
 config_error = None
 
