@@ -12,7 +12,7 @@ from supabase import create_client
 
 # ============================================================
 # AROVI - ADULT MATCHMAKING APPLICATION
-# Flet 1.1.2 + Supabase (own "arovi" schema) + built-in admin side
+# Flet 1.1.2 + Supabase + built-in admin side
 # Complete single-file application
 # ============================================================
 
@@ -44,8 +44,6 @@ SUPABASE_KEY = (
     or ""
 ).strip()
 
-# AROVI lives in its own database schema so it can share a Supabase
-# project with other apps. Set AROVI_SCHEMA=public to use the old layout.
 SCHEMA = (os.getenv("AROVI_SCHEMA", "public") or "public").strip()
 PHOTO_BUCKET = (os.getenv("AROVI_BUCKET", "arovi-photos") or "arovi-photos").strip()
 SUPPORT_EMAIL = (
@@ -164,7 +162,7 @@ class AroviData:
         except Exception:
             return ""
 
-@staticmethod
+    @staticmethod
     def with_age(row):
         if "birth_date" in row:
             row["age"] = calc_age(row.get("birth_date"))
